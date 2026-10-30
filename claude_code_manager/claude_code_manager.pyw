@@ -3,19 +3,17 @@
  Claude Code Manager ― PySide6 Edition
  ──────────── Управление Claude Code, opencode и Base URL
 -----------------------------------------------------
- Автор / Author: on1felix
-   Discord:  on1felix
-   GitHub:   https://github.com/on1felix/claude_code_manager
- © 2026 on1felix. GNU GENERAL PUBLIC LICENSE v3
+ GitHub:   https://github.com/Glebsky/Claude-Code-Manager
+ GNU GENERAL PUBLIC LICENSE v3
 =====================================================
 """
 
-# Контакты автора (используются в логах при старте и в футере)
-AUTHOR_NAME = "on1felix"
-AUTHOR_DISCORD = "on1felix"
-AUTHOR_GITHUB = "https://github.com/on1felix/claude_code_manager"
-AUTHOR_TELEGRAM = "https://t.me/on1felix001"
-APP_SITE_URL = "https://claude-code-manager.netlify.app"
+# Контакты и репозиторий (используются в логах при старте и в футере)
+AUTHOR_NAME = ""
+AUTHOR_DISCORD = ""
+AUTHOR_GITHUB = "https://github.com/Glebsky/Claude-Code-Manager"
+AUTHOR_TELEGRAM = ""
+APP_SITE_URL = ""
 import sys, subprocess, os, threading, time, json, socket, math, ssl, random, shutil, re, calendar, tempfile
 from pathlib import Path
 from urllib.request import urlopen, Request
@@ -37,7 +35,7 @@ SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 # в settings.json.bak, потом .bak2, .bak3 и т.д. Существующие НЕ перезаписываются
 # — по образцу «Fix Claude» с ~/.claude.json.bak.N. Восстанавливать вручную:
 # скопировать нужный .bakN обратно в settings.json.
-GITHUB_API_URL = "https://api.github.com/repos/on1felix/claude_code_manager/releases/latest"
+GITHUB_API_URL = "https://api.github.com/repos/Glebsky/Claude-Code-Manager/releases/latest"
 # ============================================================
 # ДИЗАЙН-СИСТЕМА (единый источник цветов и метрик)
 # ------------------------------------------------------------
@@ -22757,7 +22755,7 @@ def _oc_build_ccm_tui(settings):
 # ============================================================
 
 _OC_PUSH_TITLE = "Claude Code Manager"
-_OC_PUSH_AUMID = "On1Felix.ClaudeCodeManager"
+_OC_PUSH_AUMID = "ClaudeCodeManager.App"
 _OC_PUSH_LNK_NAME = "Claude Code Manager.lnk"
 _OC_PUSH_CONFIG_NAME = "ccm-notify.json"
 
@@ -37092,15 +37090,24 @@ class SidebarNav(QFrame):
         links_row.setContentsMargins(12, 0, 12, 0)
         links_row.setSpacing(40)
         links_row.addStretch(1)
-        self.link_github = _LinkIconButton(
-            "github", AUTHOR_GITHUB, (240, 240, 245), self)
-        links_row.addWidget(self.link_github)
-        self.link_tg = _LinkIconButton(
-            "telegram", AUTHOR_TELEGRAM, (55, 174, 226), self)
-        links_row.addWidget(self.link_tg)
-        self.link_app = _LinkIconButton(
-            "app", APP_SITE_URL, (217, 119, 87), self)
-        links_row.addWidget(self.link_app)
+        if AUTHOR_GITHUB:
+            self.link_github = _LinkIconButton(
+                "github", AUTHOR_GITHUB, (240, 240, 245), self)
+            links_row.addWidget(self.link_github)
+        else:
+            self.link_github = None
+        if AUTHOR_TELEGRAM:
+            self.link_tg = _LinkIconButton(
+                "telegram", AUTHOR_TELEGRAM, (55, 174, 226), self)
+            links_row.addWidget(self.link_tg)
+        else:
+            self.link_tg = None
+        if APP_SITE_URL:
+            self.link_app = _LinkIconButton(
+                "app", APP_SITE_URL, (217, 119, 87), self)
+            links_row.addWidget(self.link_app)
+        else:
+            self.link_app = None
         links_row.addStretch(1)
         root.addLayout(links_row)
 
@@ -38665,8 +38672,13 @@ class ClaudeManager(QMainWindow):
         """Стартовый баннер в консоль. Вынесено отдельно, чтобы перепечатать
         его на актуальном языке после смены EN/RU."""
         self.log(tr("Приложение запущено"), "info")
-        self.log(tr("Автор:") + f" {AUTHOR_NAME}  •  Discord: {AUTHOR_DISCORD}", "info")
-        self.log(f"GitHub: {AUTHOR_GITHUB}", "info")
+        if AUTHOR_NAME:
+            author_str = tr("Автор:") + f" {AUTHOR_NAME}"
+            if AUTHOR_DISCORD:
+                author_str += f"  •  Discord: {AUTHOR_DISCORD}"
+            self.log(author_str, "info")
+        if AUTHOR_GITHUB:
+            self.log(f"GitHub: {AUTHOR_GITHUB}", "info")
         self.log("─" * 50, "info")
         self.log(tr("opencode CLI: установка/обновление через npm"), "info")
         self.log(tr("opencode можно запускать без ключа и модели"), "info")
