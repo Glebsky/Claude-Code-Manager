@@ -493,6 +493,10 @@ _SETTINGS_BLOCKS = (
     ("Custom models (Anthropic)", (
         "custom_models",
     )),
+    ("Model Roles & Multi-Model Mapping", (
+        "model_role_haiku", "model_role_sonnet", "model_role_opus",
+        "model_role_fable", "model_role_custom", "model_roles_sync_all_agents",
+    )),
     ("OpenAI (Codex)", (
         "openai_model", "openai_effort", "openai_base_url",
         "openai_base_urls",
@@ -638,6 +642,13 @@ def _default_settings():
         "custom_base_urls": list(DEFAULT_BASE_URLS),
         "custom_model": "Opus 4.8",
         "custom_models": [],
+        "model_role_haiku": "",
+        "model_role_sonnet": "",
+        "model_role_opus": "",
+        "model_role_fable": "",
+        "model_role_custom": "",
+        "model_roles_sync_all_agents": True,
+        "bg_animation_enabled": True,
         "app_language": "en",
         "auto_update_enabled": True,
         "api_keys": [],
@@ -1174,6 +1185,19 @@ def migrate_oc_keys(settings):
 # кода.
 
 TRANSLATIONS = {
+    # ── Модели и анимация
+    "Получить": "Fetch",
+    "Загрузка...": "Loading...",
+    "С сервера": "From server",
+    "Получить с сервера": "Fetch from server",
+    "Анимация фона": "Background animation",
+    "включена": "enabled",
+    "выключена": "disabled",
+    "Успешно получено {} моделей с {}: {}": "Successfully fetched {} models from {}: {}",
+    "Ошибка получения моделей с {}: {}": "Failed to fetch models from {}: {}",
+    "Укажите Base URL и добавьте активный API ключ в окне «Управление»": "Specify Base URL and add an active API key in «Manage»",
+    "Автоматически запросить модели с текущего Base URL": "Automatically fetch models from current Base URL",
+    "Анимация фона: нажмите, чтобы включить/выключить": "Background animation: click to toggle on/off",
     # ── один экземпляр приложения
     "Приложение уже запущено": "The app is already running",
     # ── вкладка OpenAI / Codex CLI
@@ -8112,6 +8136,70 @@ class ModelSlider(QWidget):
         p.end()
 
 
+class _AnthropicModelsFetcher(QThread):
+    """Фоновый загрузчик моделей с эндпоинта Anthropic/OpenAI (Base URL + API Key)."""
+    models_fetched = Signal(bool, list, str)
+
+    def __init__(self, base_url, api_key, parent=None):
+        super().__init__(parent)
+        self.base_url = (base_url or "").strip()
+        self.api_key = (api_key or "").strip()
+
+    def run(self):
+        if not self.base_url:
+            self.models_fetched.emit(False, [], "Base URL не задан")
+            return
+        
+        ctx = ssl.create_default_context()
+        base = self.base_url.rstrip("/")
+        endpoints = []
+        if base.endswith("/v1"):
+            endpoints = [base + "/models", base[:-3] + "/v1/models", base[:-3] + "/models"]
+        else:
+            endpoints = [base + "/v1/models", base + "/models", base + "/api/models"]
+
+        headers = {
+            "User-Agent": f"ClaudeManager/{APP_VERSION}",
+            "Accept": "application/json",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+            headers["x-api-key"] = self.api_key
+
+        last_err = ""
+        for url in endpoints:
+            try:
+                req = Request(url, headers=headers)
+                with urlopen(req, timeout=12, context=ctx) as resp:
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+                    raw_list = []
+                    if isinstance(data, list):
+                        raw_list = data
+                    elif isinstance(data, dict):
+                        raw_list = data.get("data") or data.get("models") or []
+
+                    models = []
+                    for item in raw_list:
+                        mid = ""
+                        if isinstance(item, str):
+                            mid = item.strip()
+                        elif isinstance(item, dict):
+                            mid = str(item.get("id") or item.get("name") or item.get("model") or "").strip()
+                        if mid and mid not in models:
+                            models.append(mid)
+
+                    if models:
+                        self.models_fetched.emit(True, models, url)
+                        return
+                    else:
+                        last_err = f"Эндпоинт {url} вернул 0 моделей"
+            except Exception as e:
+                last_err = str(e)
+                continue
+
+        self.models_fetched.emit(False, [], last_err or "Модели не найдены")
+
+
 class CustomModelsWindow(QDialog):
     """Окно своих моделей (только Anthropic): список + добавление.
     Каждая строка — кнопка с ID (серая) и крестик; удаление — с
@@ -8241,6 +8329,24 @@ class CustomModelsWindow(QDialog):
         self.btn_add_model.setMaximumWidth(110)
         self.btn_add_model.clicked.connect(self.add_model)
         add_row.addWidget(self.btn_add_model)
+
+        self.btn_auto_fetch = StyledButton(tr("С сервера"), compact=True)
+        self.btn_auto_fetch.setToolTip(tr("Автоматически запросить модели с текущего Base URL"))
+        self.btn_auto_fetch.set_hover_color(100, 150, 255)
+        self.btn_auto_fetch.setMinimumHeight(0)
+        self.btn_auto_fetch.setFixedHeight(36)
+        self.btn_auto_fetch.setMaximumWidth(110)
+        self.btn_auto_fetch.clicked.connect(self._fetch_from_server)
+        add_row.addWidget(self.btn_auto_fetch)
+
+        self.btn_roles = StyledButton(tr("Роли"), compact=True)
+        self.btn_roles.setToolTip(tr("Настройка связки и ролей моделей (Haiku / Sonnet / Opus / Custom)"))
+        self.btn_roles.set_hover_color(180, 120, 240)
+        self.btn_roles.setMinimumHeight(0)
+        self.btn_roles.setFixedHeight(36)
+        self.btn_roles.setMaximumWidth(80)
+        self.btn_roles.clicked.connect(self._open_roles_dialog)
+        add_row.addWidget(self.btn_roles)
 
         layout.addLayout(add_row)
         outer.addWidget(container)
@@ -8431,6 +8537,61 @@ class CustomModelsWindow(QDialog):
         except Exception:
             pass
 
+    def _fetch_from_server(self):
+        try:
+            main_win = self.window()
+            if main_win is None or not hasattr(main_win, "settings"):
+                p = self.parent()
+                while p and not hasattr(p, "settings"):
+                    p = p.parent() if hasattr(p, "parent") else None
+                main_win = p
+            if main_win is None or not hasattr(main_win, "settings"):
+                return
+            base_url = (main_win.settings.get("custom_base_url") or "").strip()
+            sync_custom_api_key(main_win.settings)
+            api_key = (main_win.settings.get("custom_api_key") or "").strip()
+            if not base_url:
+                self.empty_lbl.setText(tr("Укажите Base URL в окне «Управление»"))
+                return
+            self.btn_auto_fetch.setEnabled(False)
+            self.btn_auto_fetch.setText(tr("Загрузка..."))
+            fetcher = _AnthropicModelsFetcher(base_url, api_key, self)
+            def _on_done(ok, models, msg):
+                try:
+                    self.btn_auto_fetch.setEnabled(True)
+                    self.btn_auto_fetch.setText(tr("С сервера"))
+                    if ok and models:
+                        added_any = False
+                        for m in models:
+                            if m not in self._models:
+                                self._models.append(m)
+                                added_any = True
+                                try:
+                                    self.model_added.emit(m)
+                                except Exception:
+                                    pass
+                        if added_any:
+                            chosen = self._selected if self._selected in self._models else models[0]
+                            self.set_models(self._models, selected=chosen)
+                            self._on_custom_selected(chosen)
+                except Exception:
+                    pass
+            fetcher.models_fetched.connect(_on_done)
+            self._server_fetcher = fetcher
+            fetcher.start()
+        except Exception:
+            pass
+
+    def _open_roles_dialog(self):
+        main_win = self.window()
+        if main_win is None or not hasattr(main_win, "settings"):
+            p = self.parent()
+            while p and not hasattr(p, "settings"):
+                p = p.parent() if hasattr(p, "parent") else None
+            main_win = p
+        dlg = AgentModelRolesDialog(parent=main_win or self)
+        dlg.exec()
+
     def add_model(self):
         mid = self.model_input.text().strip()
         if not mid:
@@ -8446,6 +8607,627 @@ class CustomModelsWindow(QDialog):
             self.model_added.emit(mid)
         except Exception:
             pass
+
+
+def auto_detect_roles(models):
+    """Автоматический подбор ролей моделей (Haiku, Sonnet, Opus, Fable, Custom)
+    на основе названий и ключевых слов."""
+    haiku, sonnet, opus, fable, custom = None, None, None, None, None
+    all_m = [m for m in (models or []) if isinstance(m, str) and m.strip()]
+    if not all_m:
+        return {"haiku": "", "sonnet": "", "opus": "", "fable": "", "custom": ""}
+
+    # 1. Opus / Reasoning tier
+    for m in all_m:
+        lm = m.lower()
+        if any(k in lm for k in ("reasoner", "opus", "thinking", "r1", "o1", "o3", "max", "pro")):
+            opus = m
+            break
+
+    # 2. Haiku / Fast tier
+    for m in all_m:
+        lm = m.lower()
+        if any(k in lm for k in ("flash", "mini", "haiku", "turbo", "lite", "fast", "small")):
+            haiku = m
+            break
+
+    # 3. Sonnet / Main tier
+    for m in all_m:
+        lm = m.lower()
+        if m not in (haiku, opus):
+            if any(k in lm for k in ("chat", "sonnet", "plus")):
+                sonnet = m
+                break
+    if not sonnet:
+        for m in all_m:
+            if m not in (haiku, opus):
+                sonnet = m
+                break
+
+    # 4. Fable / Experimental / Coder tier
+    for m in all_m:
+        if m not in (haiku, opus, sonnet):
+            lm = m.lower()
+            if any(k in lm for k in ("fable", "coder", "codex", "code", "dev")):
+                fable = m
+                break
+    if not fable:
+        for m in all_m:
+            if m not in (haiku, opus, sonnet):
+                fable = m
+                break
+
+    # 5. Custom slot
+    for m in all_m:
+        if m not in (haiku, opus, sonnet, fable):
+            custom = m
+            break
+
+    return {
+        "haiku": haiku or "",
+        "sonnet": sonnet or "",
+        "opus": opus or "",
+        "fable": fable or "",
+        "custom": custom or ""
+    }
+
+
+class AgentModelRolesDialog(QDialog):
+    """Окно настройки связки и ролей моделей (Multi-Model)
+    для Claude Code CLI, OpenCode CLI и OpenAI Codex CLI.
+    """
+    WIDTH = 580
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setModal(True)
+        self._main_win = self._find_main_window(parent)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 14, 14, 14)
+
+        container = DottedFrame()
+        container.setObjectName("agentRolesContainer")
+        self._container = container
+        container.setStyleSheet("""
+            QFrame#agentRolesContainer {
+                background-color: rgb(20, 20, 25);
+                border: 2px solid rgb(60, 60, 65);
+                border-radius: 16px;
+            }
+        """)
+        outer.addWidget(container)
+
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(24, 20, 24, 22)
+        layout.setSpacing(12)
+
+        # Title row
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+
+        left_spacer = QWidget()
+        left_spacer.setFixedSize(28, 28)
+        left_spacer.setStyleSheet("background: transparent; border: none;")
+        title_row.addWidget(left_spacer)
+
+        title = QLabel(tr("Роли и связка моделей (Multi-Model)"))
+        title.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("color: #E2E2E8; background: transparent; border: none;")
+        title_row.addWidget(title, 1)
+
+        self.btn_close = _CloseButton(parent=container)
+        self.btn_close.clicked.connect(self.reject)
+        title_row.addWidget(self.btn_close)
+        layout.addLayout(title_row)
+
+        subtitle = QLabel(tr("Назначьте привязку моделей к ролям агентов. В Claude Code CLI вы сможете переключать их через команду /model, а быстрые модели ускорят фоновые вызовы."))
+        subtitle.setFont(QFont("Segoe UI", 9))
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: rgb(155, 155, 165); background: transparent; border: none; padding: 0 10px;")
+        layout.addWidget(subtitle)
+
+        # Scroll area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical {
+                width: 6px; background: transparent; margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: rgb(60, 60, 65); border-radius: 3px; min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover { background: rgb(90, 90, 95); }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        """)
+
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        c_layout = QVBoxLayout(content)
+        c_layout.setContentsMargins(4, 4, 8, 4)
+        c_layout.setSpacing(14)
+
+        combo_style = """
+            QComboBox {
+                background-color: #14141a;
+                color: #ececf1;
+                border: 1px solid rgb(65, 65, 75);
+                border-radius: 6px;
+                padding: 5px 8px;
+                font-family: 'Segoe UI';
+                font-size: 11px;
+            }
+            QComboBox:hover {
+                border-color: rgb(110, 110, 130);
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1a1a24;
+                color: #ececf1;
+                selection-background-color: #38384a;
+                selection-color: #ffffff;
+                border: 1px solid rgb(70, 70, 80);
+                border-radius: 4px;
+                padding: 4px;
+            }
+        """
+
+        all_models = self._get_available_models()
+
+        # Section 1: Claude Code CLI Roles
+        sec1_frame = QFrame()
+        sec1_frame.setStyleSheet("""
+            QFrame {
+                background-color: rgba(26, 26, 32, 230);
+                border: 1px solid rgb(50, 50, 58);
+                border-radius: 12px;
+            }
+        """)
+        sec1_layout = QVBoxLayout(sec1_frame)
+        sec1_layout.setContentsMargins(16, 14, 16, 14)
+        sec1_layout.setSpacing(12)
+
+        sec1_title = QLabel(tr("Anthropic Claude Code CLI — распределение по тирам"))
+        sec1_title.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        sec1_title.setStyleSheet("color: #7dd3fc; border: none; background: transparent;")
+        sec1_layout.addWidget(sec1_title)
+
+        # 1. Haiku / Fast
+        self.haiku_combo = QComboBox()
+        self.haiku_combo.setStyleSheet(combo_style)
+        self.haiku_combo.addItem(tr("(По умолчанию / Не задано)"), "")
+        for m in all_models:
+            self.haiku_combo.addItem(m, m)
+        cur_haiku = self._get_setting("model_role_haiku", "")
+        if cur_haiku:
+            idx = self.haiku_combo.findData(cur_haiku)
+            if idx >= 0: self.haiku_combo.setCurrentIndex(idx)
+
+        sec1_layout.addLayout(self._create_role_row(
+            icon_color="#38bdf8",
+            title=tr("Быстрая модель (Haiku tier)"),
+            env_name="ANTHROPIC_DEFAULT_HAIKU_MODEL, ANTHROPIC_SMALL_FAST_MODEL",
+            desc=tr("Для быстрых правок, фоновых вычислений и переключения /model -> haiku"),
+            widget=self.haiku_combo
+        ))
+
+        # 2. Sonnet / Main
+        self.sonnet_combo = QComboBox()
+        self.sonnet_combo.setStyleSheet(combo_style)
+        self.sonnet_combo.addItem(tr("(По умолчанию из селектора)"), "")
+        for m in all_models:
+            self.sonnet_combo.addItem(m, m)
+        cur_sonnet = self._get_setting("model_role_sonnet", "")
+        if cur_sonnet:
+            idx = self.sonnet_combo.findData(cur_sonnet)
+            if idx >= 0: self.sonnet_combo.setCurrentIndex(idx)
+
+        sec1_layout.addLayout(self._create_role_row(
+            icon_color="#a855f7",
+            title=tr("Основная модель (Sonnet tier)"),
+            env_name="ANTHROPIC_DEFAULT_SONNET_MODEL, ANTHROPIC_MODEL",
+            desc=tr("Основной агент для диалога, кодинга и переключения /model -> sonnet"),
+            widget=self.sonnet_combo
+        ))
+
+        # 3. Opus / Reasoning
+        self.opus_combo = QComboBox()
+        self.opus_combo.setStyleSheet(combo_style)
+        self.opus_combo.addItem(tr("(По умолчанию / Не задано)"), "")
+        for m in all_models:
+            self.opus_combo.addItem(m, m)
+        cur_opus = self._get_setting("model_role_opus", "")
+        if cur_opus:
+            idx = self.opus_combo.findData(cur_opus)
+            if idx >= 0: self.opus_combo.setCurrentIndex(idx)
+
+        sec1_layout.addLayout(self._create_role_row(
+            icon_color="#f59e0b",
+            title=tr("Модель рассуждений (Opus tier)"),
+            env_name="ANTHROPIC_DEFAULT_OPUS_MODEL",
+            desc=tr("Глубокий анализ, архитектура кода и переключение /model -> opus"),
+            widget=self.opus_combo
+        ))
+
+        # 4. Fable / Experimental
+        self.fable_combo = QComboBox()
+        self.fable_combo.setStyleSheet(combo_style)
+        self.fable_combo.addItem(tr("(По умолчанию / Не задано)"), "")
+        for m in all_models:
+            self.fable_combo.addItem(m, m)
+        cur_fable = self._get_setting("model_role_fable", "")
+        if cur_fable:
+            idx = self.fable_combo.findData(cur_fable)
+            if idx >= 0: self.fable_combo.setCurrentIndex(idx)
+
+        sec1_layout.addLayout(self._create_role_row(
+            icon_color="#ec4899",
+            title=tr("Экспериментальная модель (Fable tier)"),
+            env_name="ANTHROPIC_DEFAULT_FABLE_MODEL",
+            desc=tr("Слот Fable в меню /model Claude Code (для кода или экспериментов)"),
+            widget=self.fable_combo
+        ))
+
+        # 5. Custom slot
+        self.custom_combo = QComboBox()
+        self.custom_combo.setStyleSheet(combo_style)
+        self.custom_combo.addItem(tr("(Не задано)"), "")
+        for m in all_models:
+            self.custom_combo.addItem(m, m)
+        cur_custom = self._get_setting("model_role_custom", "")
+        if cur_custom:
+            idx = self.custom_combo.findData(cur_custom)
+            if idx >= 0: self.custom_combo.setCurrentIndex(idx)
+
+        sec1_layout.addLayout(self._create_role_row(
+            icon_color="#10b981",
+            title=tr("Кастомная модель (Custom option)"),
+            env_name="ANTHROPIC_CUSTOM_MODEL_OPTION",
+            desc=tr("Дополнительный слот в меню /model внутри Claude Code"),
+            widget=self.custom_combo
+        ))
+
+        c_layout.addWidget(sec1_frame)
+
+        # Section 2: Other Agents (OpenCode & Codex)
+        sec2_frame = QFrame()
+        sec2_frame.setStyleSheet("""
+            QFrame {
+                background-color: rgba(26, 26, 32, 230);
+                border: 1px solid rgb(50, 50, 58);
+                border-radius: 12px;
+            }
+        """)
+        sec2_layout = QVBoxLayout(sec2_frame)
+        sec2_layout.setContentsMargins(16, 14, 16, 14)
+        sec2_layout.setSpacing(12)
+
+        sec2_title = QLabel(tr("Синхронизация с остальными агентами"))
+        sec2_title.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        sec2_title.setStyleSheet("color: #a78bfa; border: none; background: transparent;")
+        sec2_layout.addWidget(sec2_title)
+
+        # Checkbox OpenCode
+        self.sync_oc_chk = QCheckBox(tr("Синхронизировать все модели с OpenCode CLI"))
+        self.sync_oc_chk.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        self.sync_oc_chk.setChecked(bool(self._get_setting("model_roles_sync_all_agents", True)))
+        self.sync_oc_chk.setStyleSheet("""
+            QCheckBox {
+                color: #e2e2e8;
+                spacing: 8px;
+                background: transparent;
+                border: none;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                border: 2px solid rgb(70, 70, 80);
+                background-color: #14141a;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #6366f1;
+                border-color: #818cf8;
+            }
+        """)
+        sec2_layout.addWidget(self.sync_oc_chk)
+
+        sync_hint = QLabel(tr("Регистрирует все полученные и кастомные модели в opencode-provider.json, позволяя переключать их внутри OpenCode через /model или Tab."))
+        sync_hint.setFont(QFont("Segoe UI", 8))
+        sync_hint.setWordWrap(True)
+        sync_hint.setStyleSheet("color: rgb(140, 140, 150); background: transparent; border: none; margin-left: 26px;")
+        sec2_layout.addWidget(sync_hint)
+
+        # Codex CLI model selection
+        self.codex_combo = QComboBox()
+        self.codex_combo.setStyleSheet(combo_style)
+        for m in list(OPENAI_MODEL_ORDER) + [x for x in all_models if x not in OPENAI_MODEL_ORDER]:
+            self.codex_combo.addItem(m, m)
+        cur_codex = self._get_setting("openai_model", "gpt-5.6-sol")
+        idx = self.codex_combo.findData(cur_codex)
+        if idx >= 0:
+            self.codex_combo.setCurrentIndex(idx)
+
+        sec2_layout.addLayout(self._create_role_row(
+            icon_color="#ec4899",
+            title=tr("Модель для OpenAI Codex CLI"),
+            env_name="config.toml & --model",
+            desc=tr("Модель по умолчанию при запуске Codex CLI"),
+            widget=self.codex_combo
+        ))
+
+        c_layout.addWidget(sec2_frame)
+
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+
+        # Bottom Buttons
+        btn_bar = QHBoxLayout()
+        btn_bar.setContentsMargins(0, 4, 0, 0)
+        btn_bar.setSpacing(10)
+
+        self.btn_auto_map = StyledButton(tr("✨ Авто-подбор"), compact=True)
+        self.btn_auto_map.setToolTip(tr("Автоматически подобрать модели для ролей на основе их названий (flash, reasoner, chat)"))
+        self.btn_auto_map.setFixedHeight(36)
+        self.btn_auto_map.set_hover_color(167, 139, 250)
+        self.btn_auto_map.clicked.connect(self._auto_map_roles)
+        btn_bar.addWidget(self.btn_auto_map)
+
+        btn_bar.addStretch(1)
+
+        self.btn_cancel = StyledButton(tr("Отмена"), compact=True)
+        self.btn_cancel.setFixedHeight(36)
+        self.btn_cancel.setFixedWidth(90)
+        self.btn_cancel.set_hover_color(140, 140, 145)
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_bar.addWidget(self.btn_cancel)
+
+        self.btn_save = StyledButton(tr("Сохранить"), compact=True)
+        self.btn_save.setFixedHeight(36)
+        self.btn_save.setFixedWidth(110)
+        self.btn_save.set_hover_color(80, 200, 120)
+        self.btn_save.clicked.connect(self._save_roles)
+        btn_bar.addWidget(self.btn_save)
+
+        layout.addLayout(btn_bar)
+
+        self.setFixedWidth(self.WIDTH)
+        self.setFixedHeight(640)
+
+        # Fade in animation
+        self._opacity_effect = QGraphicsOpacityEffect(self)
+        self._opacity_effect.setOpacity(0.0)
+        self.setGraphicsEffect(self._opacity_effect)
+        self._fade_anim = QPropertyAnimation(self._opacity_effect, b"opacity", self)
+        self._fade_anim.setDuration(220)
+        self._fade_anim.setStartValue(0.0)
+        self._fade_anim.setEndValue(1.0)
+        self._fade_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._closing = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        try:
+            self._fade_anim.start()
+        except Exception:
+            pass
+
+    def accept(self):
+        try:
+            if getattr(self, "_closing", False):
+                return
+        except Exception:
+            pass
+        self._closing = True
+        try:
+            fade = QPropertyAnimation(self._opacity_effect, b"opacity", self)
+            fade.setDuration(180)
+            fade.setStartValue(self._opacity_effect.opacity())
+            fade.setEndValue(0.0)
+            fade.setEasingCurve(QEasingCurve.OutCubic)
+            fade.finished.connect(lambda: super(AgentModelRolesDialog, self).accept())
+            fade.start()
+            self._fade_out = fade
+        except Exception:
+            try:
+                super().accept()
+            except Exception:
+                pass
+
+    def reject(self):
+        try:
+            if getattr(self, "_closing", False):
+                return
+        except Exception:
+            pass
+        self._closing = True
+        try:
+            fade = QPropertyAnimation(self._opacity_effect, b"opacity", self)
+            fade.setDuration(180)
+            fade.setStartValue(self._opacity_effect.opacity())
+            fade.setEndValue(0.0)
+            fade.setEasingCurve(QEasingCurve.OutCubic)
+            fade.finished.connect(lambda: super(AgentModelRolesDialog, self).reject())
+            fade.start()
+            self._fade_out = fade
+        except Exception:
+            try:
+                super().reject()
+            except Exception:
+                pass
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._win_drag_offset = (event.globalPosition().toPoint()
+                                     - self.frameGeometry().topLeft())
+            self._win_dragging = True
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if getattr(self, "_win_dragging", False) and (event.buttons() & Qt.LeftButton):
+            self.move(event.globalPosition().toPoint() - self._win_drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._win_dragging = False
+        super().mouseReleaseEvent(event)
+
+    def _find_main_window(self, parent):
+        cur = parent
+        while cur:
+            if hasattr(cur, "settings"):
+                return cur
+            cur = cur.parent() if hasattr(cur, "parent") else None
+        return None
+
+    def _get_setting(self, key, default=""):
+        if self._main_win and hasattr(self._main_win, "settings"):
+            return self._main_win.settings.get(key, default)
+        return default
+
+    def _get_available_models(self):
+        models = []
+        if self._main_win and hasattr(self._main_win, "settings"):
+            customs = self._main_win.settings.get("custom_models", []) or []
+            for m in customs:
+                if m and m not in models:
+                    models.append(m)
+        for m in MODEL_ORDER:
+            if m not in models:
+                models.append(m)
+        return models
+
+    def _create_role_row(self, icon_color, title, env_name, desc, widget):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 2, 0, 2)
+        row.setSpacing(12)
+
+        left_layout = QVBoxLayout()
+        left_layout.setSpacing(2)
+
+        title_h = QHBoxLayout()
+        title_h.setSpacing(6)
+        dot = QLabel("●")
+        dot.setStyleSheet(f"color: {icon_color}; font-size: 12px; background: transparent; border: none;")
+        title_h.addWidget(dot)
+
+        t_lbl = QLabel(title)
+        t_lbl.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        t_lbl.setStyleSheet("color: #e2e2e8; background: transparent; border: none;")
+        title_h.addWidget(t_lbl)
+        title_h.addStretch(1)
+        left_layout.addLayout(title_h)
+
+        e_lbl = QLabel(f"${env_name}")
+        e_lbl.setFont(QFont("Consolas", 8))
+        e_lbl.setStyleSheet("color: #94a3b8; background: transparent; border: none;")
+        left_layout.addWidget(e_lbl)
+
+        d_lbl = QLabel(desc)
+        d_lbl.setFont(QFont("Segoe UI", 8))
+        d_lbl.setWordWrap(True)
+        d_lbl.setStyleSheet("color: #64748b; background: transparent; border: none;")
+        left_layout.addWidget(d_lbl)
+
+        row.addLayout(left_layout, 1)
+
+        widget.setFixedWidth(210)
+        widget.setFixedHeight(32)
+        row.addWidget(widget)
+        return row
+
+    def _auto_map_roles(self):
+        models = self._get_available_models()
+        if not models:
+            return
+        mapping = auto_detect_roles(models)
+        if mapping.get("haiku"):
+            idx = self.haiku_combo.findData(mapping["haiku"])
+            if idx >= 0: self.haiku_combo.setCurrentIndex(idx)
+        if mapping.get("sonnet"):
+            idx = self.sonnet_combo.findData(mapping["sonnet"])
+            if idx >= 0: self.sonnet_combo.setCurrentIndex(idx)
+        if mapping.get("opus"):
+            idx = self.opus_combo.findData(mapping["opus"])
+            if idx >= 0: self.opus_combo.setCurrentIndex(idx)
+        if mapping.get("fable"):
+            idx = self.fable_combo.findData(mapping["fable"])
+            if idx >= 0: self.fable_combo.setCurrentIndex(idx)
+        if mapping.get("custom"):
+            idx = self.custom_combo.findData(mapping["custom"])
+            if idx >= 0: self.custom_combo.setCurrentIndex(idx)
+        if mapping.get("sonnet"):
+            idx = self.codex_combo.findData(mapping["sonnet"])
+            if idx >= 0: self.codex_combo.setCurrentIndex(idx)
+        if self._main_win and hasattr(self._main_win, "log"):
+            self._main_win.log(tr("Авто-подбор ролей: Haiku={}, Sonnet={}, Opus={}, Fable={}, Custom={}").format(
+                mapping.get("haiku", "-"),
+                mapping.get("sonnet", "-"),
+                mapping.get("opus", "-"),
+                mapping.get("fable", "-"),
+                mapping.get("custom", "-")
+            ), "info")
+
+    def _save_roles(self):
+        if not self._main_win or not hasattr(self._main_win, "settings"):
+            self.accept()
+            return
+
+        haiku_val = self.haiku_combo.currentData() or ""
+        sonnet_val = self.sonnet_combo.currentData() or ""
+        opus_val = self.opus_combo.currentData() or ""
+        custom_val = self.custom_combo.currentData() or ""
+        sync_oc = self.sync_oc_chk.isChecked()
+        codex_model = self.codex_combo.currentData() or self.codex_combo.currentText()
+
+        fable_val = self.fable_combo.currentData() or ""
+        self._main_win.settings["model_role_haiku"] = haiku_val
+        self._main_win.settings["model_role_sonnet"] = sonnet_val
+        self._main_win.settings["model_role_opus"] = opus_val
+        self._main_win.settings["model_role_fable"] = fable_val
+        self._main_win.settings["model_role_custom"] = custom_val
+        self._main_win.settings["model_roles_sync_all_agents"] = sync_oc
+        if codex_model:
+            self._main_win.settings["openai_model"] = codex_model
+            if hasattr(self._main_win, "_sync_openai_combo_items"):
+                self._main_win._sync_openai_combo_items()
+
+        save_settings(self._main_win.settings)
+
+        # Write to ~/.claude/settings.json
+        cur_model = self._main_win.settings.get("custom_model", "")
+        if hasattr(self._main_win, "_write_claude_model_setting"):
+            self._main_win._write_claude_model_setting(cur_model)
+
+        # Update OpenCode config if needed
+        if sync_oc and hasattr(self._main_win, "_write_oc_provider_config"):
+            try:
+                oc_url = (self._main_win.settings.get("oc_base_url") or self._main_win.settings.get("custom_base_url") or "").strip()
+                oc_key = (self._main_win.settings.get("oc_api_key") or self._main_win.settings.get("custom_api_key") or "").strip()
+                if oc_url:
+                    self._main_win._write_oc_provider_config(oc_url, oc_key, [])
+            except Exception:
+                pass
+
+        if hasattr(self._main_win, "log"):
+            self._main_win.log(tr("Настройки ролей моделей сохранены и применены"), "success")
+
+        self.accept()
 
 
 class ModelDialog(QDialog):
@@ -34481,6 +35263,53 @@ def _paint_icon_placements(painter, placements, icon):
         painter.restore()
 
 
+class AnimationToggle(QWidget):
+    """Компактная кнопка-тумблер анимации фона (рядом с переключателем языка)."""
+    toggled = Signal(bool)
+
+    def __init__(self, active=True, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(62, 22)
+        self.setCursor(Qt.PointingHandCursor)
+        self._active = bool(active)
+        self.setToolTip(tr("Анимация фона: нажмите, чтобы включить/выключить"))
+
+    def set_active(self, val):
+        self._active = bool(val)
+        self.update()
+
+    def is_active(self):
+        return self._active
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._active = not self._active
+            self.toggled.emit(self._active)
+            self.update()
+            e.accept()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect().adjusted(1, 1, -1, -1)
+        if self._active:
+            bg = QColor(30, 60, 50, 200)
+            border = QColor(52, 211, 153, 210)
+            text_col = QColor(100, 240, 180)
+            txt = "✨ FX"
+        else:
+            bg = QColor(24, 24, 30, 200)
+            border = QColor(60, 60, 70, 160)
+            text_col = QColor(135, 135, 145)
+            txt = "FX off"
+        p.setBrush(bg)
+        p.setPen(border)
+        p.drawRoundedRect(r, 6, 6)
+        p.setPen(text_col)
+        p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        p.drawText(r, Qt.AlignCenter, txt)
+
+
 class DottedBackground(QWidget):
     """Тёмный фон с разбросанными едва заметными иконками приложения."""
 
@@ -34489,11 +35318,40 @@ class DottedBackground(QWidget):
     ICON_SIZE = 40
     GRID_STEP = 130
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, animated=True):
         super().__init__(parent)
         self._pattern_seed = random.randint(0, 0xFFFFFFFF)
         self._cached_size = None
         self._cached_placements = None
+        self._animated = bool(animated)
+        self._t = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(40)  # 25 fps: плавно и ультра-лёгкая нагрузка на CPU (< 0.5%)
+        self._timer.timeout.connect(self._on_tick)
+        if self._animated:
+            self._timer.start()
+
+    def set_animated(self, enabled):
+        enabled = bool(enabled)
+        if self._animated == enabled:
+            return
+        self._animated = enabled
+        if self._animated:
+            self._timer.start()
+        else:
+            self._timer.stop()
+        self.update()
+
+    def is_animated(self):
+        return self._animated
+
+    def _on_tick(self):
+        if not self.isVisible():
+            return
+        self._t += 0.03
+        if self._t > 1000000.0:
+            self._t = 0.0
+        self.update()
 
     def _get_placements(self, w, h):
         key = (w, h)
@@ -34508,11 +35366,56 @@ class DottedBackground(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        w, h = self.width(), self.height()
         painter.fillRect(self.rect(), self.BASE_COLOR)
+
+        # Мягкое атмосферное свечение (ambient glow)
+        if self._animated and w > 20 and h > 20:
+            t = self._t
+            cx1 = w * 0.28 + math.sin(t * 0.35) * (w * 0.08)
+            cy1 = h * 0.35 + math.cos(t * 0.28) * (h * 0.08)
+            r1 = max(w, h) * 0.5
+            g1 = QRadialGradient(cx1, cy1, r1)
+            g1.setColorAt(0.0, QColor(35, 55, 95, 38))
+            g1.setColorAt(0.6, QColor(25, 35, 60, 15))
+            g1.setColorAt(1.0, QColor(20, 20, 25, 0))
+            painter.fillRect(self.rect(), g1)
+
+            cx2 = w * 0.75 + math.cos(t * 0.32) * (w * 0.09)
+            cy2 = h * 0.68 + math.sin(t * 0.38) * (h * 0.08)
+            r2 = max(w, h) * 0.45
+            g2 = QRadialGradient(cx2, cy2, r2)
+            g2.setColorAt(0.0, QColor(25, 65, 55, 28))
+            g2.setColorAt(0.6, QColor(20, 45, 40, 12))
+            g2.setColorAt(1.0, QColor(20, 20, 25, 0))
+            painter.fillRect(self.rect(), g2)
+
         icon = _get_tinted_icon(self.ICON_SIZE, self.ICON_COLOR)
         if icon is None or icon.isNull():
             return
-        _paint_icon_placements(painter, self._get_placements(self.width(), self.height()), icon)
+
+        placements = self._get_placements(w, h)
+        if not self._animated:
+            _paint_icon_placements(painter, placements, icon)
+        else:
+            t = self._t
+            iw = icon.width()
+            ih = icon.height()
+            hx = iw // 2
+            hy = ih // 2
+            for idx, (x, y, rot, scale) in enumerate(placements):
+                phase = (x * 0.015 + y * 0.02)
+                dx = math.sin(t * 0.5 + phase) * 4.5
+                dy = math.cos(t * 0.4 + phase) * 4.5
+                drot = rot + math.sin(t * 0.3 + phase) * 3.0
+                alpha_factor = 0.85 + 0.15 * math.sin(t * 0.6 + phase)
+                painter.save()
+                painter.translate(x + dx, y + dy)
+                painter.rotate(drot)
+                painter.scale(scale, scale)
+                painter.setOpacity(alpha_factor)
+                painter.drawPixmap(-hx, -hy, icon)
+                painter.restore()
 
 
 class DottedFrame(QFrame):
@@ -36572,8 +37475,10 @@ class ClaudeManager(QMainWindow):
         # Фон-узоры — ОДИН на всё окно (как в оригинале): их рисует сам root
         # (DottedBackground), а сайдбар и контент прозрачные — узор идёт
         # сплошняком через разделитель, без швов и вторых сеток.
-        root = DottedBackground()
+        bg_anim_on = self.settings.get("bg_animation_enabled", True)
+        root = DottedBackground(animated=bg_anim_on)
         root.setObjectName("app_root")
+        self.root_bg = root
         self.setCentralWidget(root)
         shell = QHBoxLayout(root)
         shell.setContentsMargins(0, 0, 0, 0)
@@ -36790,6 +37695,11 @@ class ClaudeManager(QMainWindow):
         self.language_toggle.move(self.width() - 78 - 8, 12)
         self.language_toggle.raise_()
         self.language_toggle.toggled.connect(self._on_language_toggled)
+
+        self.anim_toggle = AnimationToggle(active=bg_anim_on, parent=self)
+        self.anim_toggle.move(self.width() - 78 - 8 - 68, 12)
+        self.anim_toggle.raise_()
+        self.anim_toggle.toggled.connect(self._on_bg_animation_toggled)
         if LANG is not None:
             LANG.language_changed.connect(self._on_language_changed)
 
@@ -37255,6 +38165,22 @@ class ClaudeManager(QMainWindow):
         self._sync_custom_combo_items()
         model_row.addWidget(self.fm_model_combo, 1)
 
+        self.fm_btn_fetch_models = StyledButton(tr("Получить"), compact=True)
+        self.fm_btn_fetch_models.setToolTip(tr("Автоматически запросить модели с текущего Base URL"))
+        self.fm_btn_fetch_models.setFixedHeight(36)
+        self.fm_btn_fetch_models.setFixedWidth(100)
+        self.fm_btn_fetch_models.set_hover_color(100, 150, 255)
+        self.fm_btn_fetch_models.clicked.connect(self._fm_fetch_models)
+        model_row.addWidget(self.fm_btn_fetch_models)
+
+        self.fm_btn_model_roles = StyledButton(tr("Роли"), compact=True)
+        self.fm_btn_model_roles.setToolTip(tr("Настройка связки и ролей моделей (Haiku / Sonnet / Opus / Custom) для Claude Code и агентов"))
+        self.fm_btn_model_roles.setFixedHeight(36)
+        self.fm_btn_model_roles.setFixedWidth(80)
+        self.fm_btn_model_roles.set_hover_color(180, 120, 240)
+        self.fm_btn_model_roles.clicked.connect(self._open_model_roles_dialog)
+        model_row.addWidget(self.fm_btn_model_roles)
+
         # Effort — вертикальная палочка-индикатор внутри правой части комбобокса
         # модели: сегменты уровня + подпись. Display-only и прозрачна для мыши —
         # клик открывает ModelDialog как обычно. Отдельного блока effort больше нет.
@@ -37395,7 +38321,11 @@ class ClaudeManager(QMainWindow):
                 self.oa_model_combo.setItemData(i, oa_model_colors[txt], Qt.ForegroundRole)
         self.oa_model_combo.set_picker(colors=oa_model_colors, title=tr("Выбор модели"))
         saved_oa_model = self.settings.get("openai_model") or "gpt-5.6-sol"
-        if saved_oa_model not in OPENAI_MODEL_ORDER:
+        customs = self.settings.get("custom_models", []) or []
+        for cm in customs:
+            if cm and cm not in OPENAI_MODEL_ORDER:
+                self.oa_model_combo.addItem(cm)
+        if saved_oa_model not in OPENAI_MODEL_ORDER and saved_oa_model not in customs:
             saved_oa_model = "gpt-5.6-sol"
         self.oa_model_combo.setCurrentText(saved_oa_model)
         if saved_oa_model in oa_model_colors:
@@ -37888,6 +38818,99 @@ class ClaudeManager(QMainWindow):
         except Exception:
             pass
 
+    def _on_bg_animation_toggled(self, active):
+        self.settings["bg_animation_enabled"] = bool(active)
+        save_settings(self.settings)
+        if hasattr(self, "root_bg"):
+            self.root_bg.set_animated(bool(active))
+        status_txt = tr("включена") if active else tr("выключена")
+        self.log(f"{tr('Анимация фона')}: {status_txt}", "info")
+
+    def _fm_fetch_models(self, silent=False):
+        """Автоматически получает список доступных моделей с активного Base URL."""
+        base_url = (self.settings.get("custom_base_url") or "").strip()
+        sync_custom_api_key(self.settings)
+        api_key = (self.settings.get("custom_api_key") or "").strip()
+        if not base_url:
+            if not silent:
+                self.log(tr("Укажите Base URL и добавьте активный API ключ в окне «Управление»"), "warning")
+            return
+
+        if hasattr(self, "fm_btn_fetch_models"):
+            self.fm_btn_fetch_models.setText(tr("Загрузка..."))
+            self.fm_btn_fetch_models.setEnabled(False)
+
+        fetcher = _AnthropicModelsFetcher(base_url, api_key, self)
+
+        def _on_models_fetched(ok, models, info):
+            if hasattr(self, "fm_btn_fetch_models"):
+                self.fm_btn_fetch_models.setText(tr("Получить"))
+                self.fm_btn_fetch_models.setEnabled(True)
+
+            if ok and models:
+                customs = self.settings.get("custom_models", []) or []
+                for m in models:
+                    if m not in customs:
+                        customs.append(m)
+                self.settings["custom_models"] = customs
+                cur_m = self.settings.get("custom_model", "")
+                if not cur_m or cur_m in ("Opus 4.8", "") or cur_m not in customs:
+                    if models:
+                        self.settings["custom_model"] = models[0]
+                if not self.settings.get("model_role_haiku") and not self.settings.get("model_role_opus"):
+                    detected = auto_detect_roles(customs)
+                    if detected.get("haiku"):
+                        self.settings["model_role_haiku"] = detected["haiku"]
+                    if detected.get("sonnet"):
+                        self.settings["model_role_sonnet"] = detected["sonnet"]
+                    if detected.get("opus"):
+                        self.settings["model_role_opus"] = detected["opus"]
+                    if detected.get("fable"):
+                        self.settings["model_role_fable"] = detected["fable"]
+                    if detected.get("custom"):
+                        self.settings["model_role_custom"] = detected["custom"]
+                save_settings(self.settings)
+                self._sync_custom_combo_items()
+                self._sync_openai_combo_items()
+                self._write_claude_model_setting(self.settings.get("custom_model", ""))
+                sample = ", ".join(models[:5]) + ("..." if len(models) > 5 else "")
+                self.log(tr("Успешно получено {} моделей с {}: {}").format(len(models), base_url, sample), "success")
+            else:
+                if not silent:
+                    self.log(tr("Ошибка получения моделей с {}: {}").format(base_url, info), "error")
+
+        fetcher.models_fetched.connect(_on_models_fetched)
+        self._fm_fetcher = fetcher
+        fetcher.start()
+
+    def _ensure_claude_custom_api_key_approved(self, api_key):
+        """Добавляет API-ключ в approved-список ~/.claude.json, чтобы Claude Code
+        не прерывал запуск интерактивным вопросом о подтверждении кастомного ключа."""
+        if not api_key:
+            return
+        try:
+            path = os.path.join(os.path.expanduser("~"), ".claude.json")
+            data = {}
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+            resp = data.setdefault("customApiKeyResponses", {})
+            approved = resp.setdefault("approved", [])
+            suffix = api_key[-20:] if len(api_key) >= 20 else api_key
+            changed = False
+            for val in (suffix, api_key):
+                if val not in approved:
+                    approved.append(val)
+                    changed = True
+            if changed:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
     def _on_language_toggled(self, code):
         """Клик по LanguageToggle — обновляем глобальный LANG."""
         if LANG is not None:
@@ -38168,6 +39191,30 @@ class ClaudeManager(QMainWindow):
         # Обновить «предыдущую» модель для будущих откатов
         if new_model:
             self._fm_prev_model = new_model
+
+    def _open_model_roles_dialog(self):
+        """Открывает окно настройки связки и ролей моделей (Multi-Model)."""
+        dlg = AgentModelRolesDialog(parent=self)
+        dlg.exec()
+
+    def _sync_openai_combo_items(self):
+        """Синхронизирует комбобокс OpenAI/Codex с кастомными моделями."""
+        if not hasattr(self, "oa_model_combo"):
+            return
+        cur = self.settings.get("openai_model") or self.oa_model_combo.currentText()
+        customs = self.settings.get("custom_models", []) or []
+        items = list(OPENAI_MODEL_ORDER)
+        for m in customs:
+            if m and m not in items:
+                items.append(m)
+        self.oa_model_combo.blockSignals(True)
+        self.oa_model_combo.clear()
+        self.oa_model_combo.addItems(items)
+        if cur in items:
+            self.oa_model_combo.setCurrentText(cur)
+        elif items:
+            self.oa_model_combo.setCurrentText(items[0])
+        self.oa_model_combo.blockSignals(False)
 
     def _sync_custom_combo_items(self):
         """Дотягивает свои модели в items комбо (dropdown не показывается —
@@ -38568,6 +39615,8 @@ class ClaudeManager(QMainWindow):
             # Обновляем видимость бейджа freemodel.dev (если удалили текущий
             # URL и фолбэкнулись на freemodel, бейдж должен вернуться).
             self._refresh_freemodel_brand_visibility()
+            if new_current and "freemodel.dev" not in new_current.lower():
+                self._fm_fetch_models(silent=True)
         except Exception as e:
             print(f"[_persist_fm_url_state] Не удалось сохранить: {e}")
 
@@ -39400,12 +40449,14 @@ class ClaudeManager(QMainWindow):
         anim.finished.connect(lambda a=anim: self._opacity_anims.remove(a) if a in self._opacity_anims else None)
 
     def resizeEvent(self, event):
-        """Окно теперь растягивается по ширине: держим пилюлю языка в правом
+        """Окно теперь растягивается по ширине: держим пилюли языка и анимации в правом
         верхнем углу, как в прежней версии с фиксированной шириной."""
         super().resizeEvent(event)
         try:
             if hasattr(self, "language_toggle"):
                 self.language_toggle.move(self.width() - 78 - 8, 12)
+            if hasattr(self, "anim_toggle"):
+                self.anim_toggle.move(self.width() - 78 - 8 - 68, 12)
         except Exception:
             pass
 
@@ -39772,17 +40823,21 @@ class ClaudeManager(QMainWindow):
         """Возвращает реальный ID модели для CLI/env или None для дефолта.
         Всегда чистый ID без суффиксов — тумблер контекста удалён.
         Свои модели (custom_models) возвращаются как есть — введённый ID
-        и есть CLI-ID (например claude-haiku-5.5:free)."""
+        и есть CLI-ID (например claude-haiku-5.5:free или deepseek-chat)."""
+        if not model_choice:
+            return None
         try:
             customs = self.settings.get("custom_models", []) or []
         except Exception:
             customs = []
         if model_choice in customs:
             return model_choice
-        return self.MODEL_ID_MAP.get(model_choice)
+        if model_choice in self.MODEL_ID_MAP:
+            return self.MODEL_ID_MAP[model_choice]
+        return model_choice
 
     def _write_claude_model_setting(self, model_choice):
-        """Записывает выбранную модель в ~/.claude/settings.json"""
+        """Записывает выбранную модель и роли окружения в ~/.claude/settings.json"""
         try:
             claude_settings_path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
             claude_settings = {}
@@ -39796,8 +40851,61 @@ class ClaudeManager(QMainWindow):
             else:
                 claude_settings["model"] = model_id
 
+            # Sync multi-model environment roles into "env" of ~/.claude/settings.json
+            if "env" not in claude_settings or not isinstance(claude_settings["env"], dict):
+                claude_settings["env"] = {}
+
+            c_base_url = (self.settings.get("custom_base_url") or "").strip()
+            if c_base_url:
+                claude_settings["env"]["ANTHROPIC_BASE_URL"] = c_base_url
+
+            haiku_m = (self.settings.get("model_role_haiku") or "").strip()
+            sonnet_m = (self.settings.get("model_role_sonnet") or "").strip()
+            opus_m = (self.settings.get("model_role_opus") or "").strip()
+            fable_m = (self.settings.get("model_role_fable") or "").strip()
+            custom_m = (self.settings.get("model_role_custom") or "").strip()
+
+            if haiku_m:
+                claude_settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = haiku_m
+                claude_settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"] = f"{haiku_m} (Haiku)"
+                claude_settings["env"]["ANTHROPIC_SMALL_FAST_MODEL"] = haiku_m
+            else:
+                claude_settings["env"].pop("ANTHROPIC_DEFAULT_HAIKU_MODEL", None)
+                claude_settings["env"].pop("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME", None)
+                claude_settings["env"].pop("ANTHROPIC_SMALL_FAST_MODEL", None)
+
+            if sonnet_m:
+                claude_settings["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] = sonnet_m
+                claude_settings["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] = f"{sonnet_m} (Sonnet)"
+            else:
+                claude_settings["env"].pop("ANTHROPIC_DEFAULT_SONNET_MODEL", None)
+                claude_settings["env"].pop("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME", None)
+
+            if opus_m:
+                claude_settings["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] = opus_m
+                claude_settings["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"] = f"{opus_m} (Opus)"
+            else:
+                claude_settings["env"].pop("ANTHROPIC_DEFAULT_OPUS_MODEL", None)
+                claude_settings["env"].pop("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME", None)
+
+            if fable_m:
+                claude_settings["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL"] = fable_m
+                claude_settings["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] = f"{fable_m} (Fable)"
+            else:
+                claude_settings["env"].pop("ANTHROPIC_DEFAULT_FABLE_MODEL", None)
+                claude_settings["env"].pop("ANTHROPIC_DEFAULT_FABLE_MODEL_NAME", None)
+
+            if custom_m:
+                claude_settings["env"]["ANTHROPIC_CUSTOM_MODEL_OPTION"] = custom_m
+                claude_settings["env"]["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = f"{custom_m} (Custom)"
+                claude_settings["env"]["ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"] = f"Custom model {custom_m}"
+            else:
+                claude_settings["env"].pop("ANTHROPIC_CUSTOM_MODEL_OPTION", None)
+                claude_settings["env"].pop("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME", None)
+                claude_settings["env"].pop("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION", None)
+
             with open(claude_settings_path, 'w', encoding='utf-8') as f:
-                json.dump(claude_settings, f, indent=2)
+                json.dump(claude_settings, f, indent=2, ensure_ascii=False)
         except Exception as e:
             self.log(tr("Не удалось записать модель в настройки Claude: {}").format(e), "warning")
 
@@ -39951,10 +41059,75 @@ class ClaudeManager(QMainWindow):
 
         env["ANTHROPIC_API_KEY"] = custom_api_key
         env["ANTHROPIC_BASE_URL"] = custom_base_url
-        env.pop("ANTHROPIC_MODEL", None)
-        env.pop("ANTHROPIC_SMALL_FAST_MODEL", None)
+        model_id = self._resolve_model_id(custom_model)
+        if model_id:
+            env["ANTHROPIC_MODEL"] = model_id
+        else:
+            env.pop("ANTHROPIC_MODEL", None)
+
+        haiku_model = (self.settings.get("model_role_haiku") or "").strip()
+        sonnet_model = (self.settings.get("model_role_sonnet") or "").strip()
+        opus_model = (self.settings.get("model_role_opus") or "").strip()
+        fable_model = (self.settings.get("model_role_fable") or "").strip()
+        custom_opt_model = (self.settings.get("model_role_custom") or "").strip()
+
+        if haiku_model:
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = haiku_model
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"] = f"{haiku_model} (Haiku)"
+            env["ANTHROPIC_SMALL_FAST_MODEL"] = haiku_model
+        elif model_id:
+            env["ANTHROPIC_SMALL_FAST_MODEL"] = model_id
+        else:
+            env.pop("ANTHROPIC_DEFAULT_HAIKU_MODEL", None)
+            env.pop("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME", None)
+            env.pop("ANTHROPIC_SMALL_FAST_MODEL", None)
+
+        if sonnet_model:
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = sonnet_model
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] = f"{sonnet_model} (Sonnet)"
+        elif model_id:
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model_id
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] = f"{model_id} (Sonnet)"
+        else:
+            env.pop("ANTHROPIC_DEFAULT_SONNET_MODEL", None)
+            env.pop("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME", None)
+
+        if opus_model:
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = opus_model
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"] = f"{opus_model} (Opus)"
+        else:
+            env.pop("ANTHROPIC_DEFAULT_OPUS_MODEL", None)
+            env.pop("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME", None)
+
+        if fable_model:
+            env["ANTHROPIC_DEFAULT_FABLE_MODEL"] = fable_model
+            env["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] = f"{fable_model} (Fable)"
+        else:
+            env.pop("ANTHROPIC_DEFAULT_FABLE_MODEL", None)
+            env.pop("ANTHROPIC_DEFAULT_FABLE_MODEL_NAME", None)
+
+        if custom_opt_model:
+            env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = custom_opt_model
+            env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = f"{custom_opt_model} (Custom)"
+            env["ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"] = f"Custom model {custom_opt_model}"
+        else:
+            env.pop("ANTHROPIC_CUSTOM_MODEL_OPTION", None)
+            env.pop("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME", None)
+            env.pop("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION", None)
+
+        role_summary = []
+        if haiku_model: role_summary.append(f"Haiku={haiku_model}")
+        if sonnet_model: role_summary.append(f"Sonnet={sonnet_model}")
+        if opus_model: role_summary.append(f"Opus={opus_model}")
+        if fable_model: role_summary.append(f"Fable={fable_model}")
+        if custom_opt_model: role_summary.append(f"Custom={custom_opt_model}")
+        if role_summary:
+            self.log(tr("Назначенные роли моделей: {}").format(", ".join(role_summary)), "info")
+
         env["ANTHROPIC_AUTH_TOKEN"] = ""
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+
+        self._ensure_claude_custom_api_key_approved(custom_api_key)
 
         # Записываем модель в ~/.claude/settings.json для BaseURL
         self._write_claude_model_setting(custom_model)
@@ -41708,8 +42881,17 @@ class ClaudeManager(QMainWindow):
         # NB: ключ "theme" сюда НЕ пишем — в opencode.json тема deprecated
         # и игнорируется, выбор темы читается только из tui.json
         # (см. _oc_tui_theme_set). Было проверено по документации.
+        all_models = list(model_ids or [])
+        if self.settings.get("model_roles_sync_all_agents", True):
+            for m in (self.settings.get("custom_models", []) or []):
+                if m and m not in all_models:
+                    all_models.append(m)
+            for role_key in ("model_role_haiku", "model_role_sonnet", "model_role_opus", "model_role_fable", "model_role_custom", "custom_model"):
+                rm = (self.settings.get(role_key) or "").strip()
+                if rm and rm not in all_models and not rm.startswith("("):
+                    all_models.append(rm)
         config = _oc_custom_provider_doc(
-            base_url, api_key, model_ids, v2=v2)
+            base_url, api_key, all_models, v2=v2)
         try:
             os.makedirs(SETTINGS_DIR, exist_ok=True)
             path = os.path.join(SETTINGS_DIR, "opencode-provider.json")
@@ -41950,6 +43132,23 @@ class ClaudeManager(QMainWindow):
 
         base_url = (self.settings.get("oc_base_url", "") or "").strip()
         anthropic_style = bool(base_url) and ("anthropic" in base_url.lower() or "claude" in base_url.lower())
+
+        haiku_model = (self.settings.get("model_role_haiku") or "").strip()
+        sonnet_model = (self.settings.get("model_role_sonnet") or "").strip()
+        opus_model = (self.settings.get("model_role_opus") or "").strip()
+        fable_model = (self.settings.get("model_role_fable") or "").strip()
+        custom_opt_model = (self.settings.get("model_role_custom") or "").strip()
+        if haiku_model:
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = haiku_model
+            env["ANTHROPIC_SMALL_FAST_MODEL"] = haiku_model
+        if sonnet_model:
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = sonnet_model
+        if opus_model:
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = opus_model
+        if fable_model:
+            env["ANTHROPIC_DEFAULT_FABLE_MODEL"] = fable_model
+        if custom_opt_model:
+            env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = custom_opt_model
 
         if base_url and anthropic_style:
             env["ANTHROPIC_BASE_URL"] = base_url
