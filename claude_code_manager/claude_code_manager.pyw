@@ -37439,17 +37439,13 @@ class ClaudeManager(QMainWindow):
         # запуске не нужно. Высота ниже всё равно пересчитается под режим.
         self.resize(1027, 950)
 
-        # Устанавливаем иконку - ищем в разных местах
-        icon_paths = [
-            os.path.join(os.path.dirname(__file__), "icon.ico"),
-            os.path.join(os.path.dirname(sys.executable), "icon.ico"),
-            "icon.ico"
-        ]
-
-        for icon_path in icon_paths:
-            if os.path.exists(icon_path):
-                self.setWindowIcon(QIcon(icon_path))
-                break
+        # Устанавливаем иконку окна
+        try:
+            _app_icon = get_app_icon()
+            if not _app_icon.isNull():
+                self.setWindowIcon(_app_icon)
+        except Exception:
+            pass
 
         self.settings = load_settings()
         # Интеграция opencode (профиль терминала, scoped-конфиг, push-файлы,
@@ -45227,8 +45223,51 @@ class _GlobalTooltipFilter(QObject):
 # ЗАПУСК ПРИЛОЖЕНИЯ
 # ============================================================
 
+def get_app_icon():
+    """Возвращает QIcon приложения со всеми доступными слоями разрешения."""
+    icon = QIcon()
+    base_dirs = []
+    if hasattr(sys, '_MEIPASS'):
+        base_dirs.append(sys._MEIPASS)
+    try:
+        base_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+    try:
+        base_dirs.append(os.path.dirname(sys.executable))
+    except Exception:
+        pass
+    base_dirs.append(os.getcwd())
+
+    loaded = False
+    for d in base_dirs:
+        for fname in ("icon.ico", "icon.png"):
+            p = os.path.join(d, fname)
+            if os.path.exists(p):
+                icon.addFile(p)
+                loaded = True
+    if loaded and not icon.isNull():
+        return icon
+    return QIcon()
+
+
 def main():
+    # Принудительно регистрируем AppUserModelID для корректного отображения иконки
+    # в панели задач Windows (иначе Windows вешает стандартную белую иконку)
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ClaudeCodeManager.App")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+    try:
+        _app_icon = get_app_icon()
+        if not _app_icon.isNull():
+            app.setWindowIcon(_app_icon)
+    except Exception:
+        pass
     # Глобальная таблица стилей из дизайн-системы: закрывает «щели» между
     # локальными QSS (тултипы, скроллбары, меню, диалоги, чекбоксы).
     try:
