@@ -27,9 +27,15 @@ Seamlessly utilize Claude Code CLI's native `/model` picker during active sessio
 
 ---
 
-### ✨ Ambient Particle Background FX
-- Added an unobtrusive, elegant floating particle mesh background animation.
-- Easily toggleable via an on/off switch in the settings, allowing you to choose between animated atmosphere and a clean static canvas.
+### 🌐 Multilingual UI (RU / EN / UA)
+- Added comprehensive **Ukrainian (UA)** localization alongside English (EN) and Russian (RU) covering all dialogs, notifications, tooltips, and settings.
+- Upgraded the language switcher into a sleek 3-way animated pill toggle (RU / EN / UA) with distinct accent glows.
+
+---
+
+### ✨ Shimmering Iridescent Gradient Animation
+- Upgraded the background animation with rich, flowing multi-hue radial gradients (aurora effect) that smoothly cycle and blend.
+- Calibrated to remain subtle and non-distracting while giving an aesthetic, living glow to the interface. Easily toggleable with the animation switch.
 
 ---
 

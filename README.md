@@ -68,7 +68,7 @@ Switch between four distinct provider modes directly from the left sidebar:
   - **Fix Claude**: repairs corrupted `~/.claude.json` files with automatic timestamped backups, fixes `installMethod` errors, and pins `DISABLE_UPDATES` to protect stability.
   - **Status Line**: preview, install, and customize the Claude Code status line.
 - **Integrated Launchers** — launch Claude Code, Codex, or opencode terminal sessions with active environment variables pre-configured.
-- **Bilingual Interface** — complete Russian and English (RU / EN) localization.
+- **Multilingual Interface** — complete Russian, English, and Ukrainian (RU / EN / UA) localization.
 
 ---
 
