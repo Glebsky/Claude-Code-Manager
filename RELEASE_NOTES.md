@@ -1,4 +1,4 @@
-# 🚀 Claude Code Manager v6.1.0
+# 🚀 Claude Code Manager v1.0
 
 A major release introducing the **Multi-Model Role Engine**, dynamic in-session `/model` switching for Claude Code CLI, one-click automated model discovery from custom Base URLs, ambient particle background animation, and unified multi-agent synchronization.
 

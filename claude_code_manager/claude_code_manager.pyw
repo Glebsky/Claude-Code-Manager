@@ -27,7 +27,7 @@ from PySide6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QText
 from PySide6.QtCore import QPointF, QRectF, QRect, QUrl, QPoint
 from PySide6.QtSvg import QSvgRenderer
 
-APP_VERSION = "6.0.8"  # Для обновлений
+APP_VERSION = "1.0"  # Для обновлений
 SETTINGS_DIR = os.path.join(os.getenv("APPDATA", os.path.expanduser("~")), "ClaudeManager")
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 # Бэкапы настроек: перед КАЖДЫМ изменением в управлении ключами (add/delete/
