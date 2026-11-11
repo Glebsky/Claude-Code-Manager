@@ -487,10 +487,11 @@ _SETTINGS_BLOCKS = (
     ("Anthropic + Claude Code - shared models, effort and keys", (
         "use_custom_token", "custom_model", "reasoning_effort",
         "reasoning_ultracode", "custom_base_url", "custom_base_urls",
-        "api_keys", "selected_key_id", "custom_api_key",
+        "api_keys", "selected_key_id", "selected_key_by_url",
+        "custom_api_key", "provider_scoped_v1",
     )),
-    ("Custom models (Anthropic)", (
-        "custom_models",
+    ("Custom models (Anthropic) - mirror of the active Base URL + per-URL store", (
+        "custom_models", "custom_models_by_url",
     )),
     ("Model Roles & Multi-Model Mapping", (
         "model_role_haiku", "model_role_sonnet", "model_role_opus",
@@ -498,11 +499,13 @@ _SETTINGS_BLOCKS = (
     )),
     ("OpenAI (Codex)", (
         "openai_model", "openai_effort", "openai_base_url",
-        "openai_base_urls",
+        "openai_base_urls", "openai_keys", "openai_selected_key_id",
+        "openai_selected_key_by_url", "openai_api_key",
+        "openai_custom_models_by_url",
     )),
     ("Custom URL (opencode)", (
         "oc_base_url", "oc_base_urls", "oc_keys", "oc_selected_key_id",
-        "oc_api_key", "oc_notify_enabled",
+        "oc_selected_key_by_url", "oc_api_key", "oc_notify_enabled",
     )),
 )
 
@@ -614,7 +617,9 @@ def load_settings():
             # файлах не трогаем; в новые файлы они не попадают, потому что
             # их нет в _default_settings(). Живьём используется custom_model.
             migrate_api_keys(loaded)
+            migrate_provider_scoping(loaded)
             migrate_oc_keys(loaded)
+            migrate_openai_keys(loaded)
             # Мёртвые ключи эпохи omniroute (omniroute_path, oc_effort/
             # oc_model/oc_models, auth_token, custom_endpoint) из чужих
             # файлов не вычищаем — оставляем как есть. В новые файлы они
@@ -652,16 +657,24 @@ def _default_settings():
         "auto_update_enabled": True,
         "api_keys": [],
         "selected_key_id": "",
+        "selected_key_by_url": {},
+        "custom_models_by_url": {},
         "app_mode": "customurl",
         "openai_base_url": DEFAULT_OPENAI_BASE_URLS[0],
         "openai_base_urls": list(DEFAULT_OPENAI_BASE_URLS),
         "openai_model": "gpt-5.6-sol",
         "openai_effort": "low",
+        "openai_keys": [],
+        "openai_selected_key_id": "",
+        "openai_selected_key_by_url": {},
+        "openai_api_key": "",
+        "openai_custom_models_by_url": {},
         "reasoning_ultracode": False,
         "oc_base_url": "",
         "oc_base_urls": [],
         "oc_keys": [],
         "oc_selected_key_id": "",
+        "oc_selected_key_by_url": {},
         "oc_api_key": "",
         "oc_notify_enabled": True,
         "seen_update_id": "",
@@ -697,6 +710,15 @@ def migrate_settings(settings):
 
 def save_settings(settings):
     ensure_settings_dir()
+    # Зеркало своих моделей активного Base URL → его запись в *_by_url.
+    try:
+        fold_cc_models(settings)
+        # Любой файл, записанный этой версией, уже «в новом формате»:
+        # одноразовая миграция (migrate_provider_scoping) его не тронет.
+        if isinstance(settings, dict):
+            settings.setdefault("provider_scoped_v1", True)
+    except Exception:
+        pass
     # Разносим по файлам: звуки/тема — в свои сайдкары (пишем, только если
     # в словаре есть их ключи или файл уже существует), остальное — в общий.
     try:
@@ -1042,21 +1064,113 @@ def key_is_usable(key):
     # Всё остальное: только зелёные пригодны.
     return key_color_state(key) == "green"
 
-def sync_custom_api_key(settings):
-    """Зеркалирует значение активного ключа в custom_api_key
-    (обратная совместимость: код запуска читает именно custom_api_key).
-    Заодно чистит устаревший selected_key_id, если такого ключа больше нет."""
-    keys = settings.get("api_keys", [])
-    ids = {k.get("id") for k in keys}
-    if settings.get("selected_key_id") and settings["selected_key_id"] not in ids:
-        settings["selected_key_id"] = ""
-    k = first_active_key(settings)
-    settings["custom_api_key"] = k.get("value", "") if k else ""
-    # Если явного выбора нет, но есть зелёный кандидат — зафиксируем его как выбранный,
-    # чтобы UI сразу подсветил активную карточку.
-    if k and not settings.get("selected_key_id"):
-        settings["selected_key_id"] = k.get("id", "")
+# ── Провайдер = Base URL ────────────────────────────────────────────────
+# У каждого Base URL СВОИ ключи и СВОИ модели; выбрав провайдера, вкладка
+# видит только его ключи/модели. Ключ хранит поле "base_url" (адрес
+# провайдера), выбранный ключ — отдельно на каждый URL (*_selected_key_by_url).
+# Три независимых области: cc (Claude Code), oa (OpenAI/Codex), oc (Custom URL).
+_KEY_SCOPES = {
+    "cc": {"keys": "api_keys", "sel": "selected_key_id",
+           "sel_map": "selected_key_by_url", "mirror": "custom_api_key",
+           "url": "custom_base_url"},
+    "oa": {"keys": "openai_keys", "sel": "openai_selected_key_id",
+           "sel_map": "openai_selected_key_by_url", "mirror": "openai_api_key",
+           "url": "openai_base_url"},
+    "oc": {"keys": "oc_keys", "sel": "oc_selected_key_id",
+           "sel_map": "oc_selected_key_by_url", "mirror": "oc_api_key",
+           "url": "oc_base_url"},
+}
+
+
+def norm_provider_url(url):
+    """Ключ сравнения провайдеров: без пробелов, хвостового / и регистра."""
+    return (url or "").strip().rstrip("/").lower()
+
+
+def _scope_url(settings, scope):
+    return norm_provider_url(settings.get(_KEY_SCOPES[scope]["url"]))
+
+
+def scope_keys(settings, scope):
+    """Ключи ТОЛЬКО активного провайдера (Base URL) указанной вкладки."""
+    cfg = _KEY_SCOPES[scope]
+    url = _scope_url(settings, scope)
+    return [k for k in (settings.get(cfg["keys"]) or [])
+            if isinstance(k, dict) and norm_provider_url(k.get("base_url")) == url]
+
+
+def scope_selected_id(settings, scope):
+    """Выбранный ключ активного провайдера ('' если не выбран)."""
+    cfg = _KEY_SCOPES[scope]
+    m = settings.get(cfg["sel_map"])
+    if not isinstance(m, dict):
+        return ""
+    return m.get(_scope_url(settings, scope)) or ""
+
+
+def _set_scope_selected(settings, scope, sel_id):
+    cfg = _KEY_SCOPES[scope]
+    m = settings.get(cfg["sel_map"])
+    if not isinstance(m, dict):
+        m = {}
+    url = _scope_url(settings, scope)
+    if sel_id:
+        m[url] = sel_id
+    else:
+        m.pop(url, None)
+    settings[cfg["sel_map"]] = m
+    # Совместимость: одиночное поле = выбор активного провайдера.
+    settings[cfg["sel"]] = sel_id or ""
+
+
+def merge_scope_keys(settings, scope, keys, selected_id):
+    """Кладёт результат окна ключей обратно в хранилище, НЕ задевая ключи
+    других провайдеров; новые ключи получают base_url активного провайдера."""
+    cfg = _KEY_SCOPES[scope]
+    url_raw = (settings.get(cfg["url"]) or "").strip()
+    url = norm_provider_url(url_raw)
+    others = [k for k in (settings.get(cfg["keys"]) or [])
+              if isinstance(k, dict) and norm_provider_url(k.get("base_url")) != url]
+    mine = []
+    for k in keys or []:
+        k = dict(k)
+        k["base_url"] = url_raw
+        mine.append(k)
+    settings[cfg["keys"]] = others + mine
+    _set_scope_selected(settings, scope, selected_id or "")
     return settings
+
+
+def sync_scope_key(settings, scope):
+    """Зеркалирует значение активного ключа активного провайдера в
+    mirror-поле вкладки (custom_api_key / openai_api_key / oc_api_key —
+    код запуска читает именно их). Чистит устаревший выбор."""
+    cfg = _KEY_SCOPES[scope]
+    mine = scope_keys(settings, scope)
+    ids = {k.get("id") for k in mine}
+    sel = scope_selected_id(settings, scope)
+    if sel and sel not in ids:
+        sel = ""
+    k = _first_active_key(mine, sel)
+    settings[cfg["mirror"]] = k.get("value", "") if k else ""
+    # Явного выбора нет, но есть зелёный кандидат — фиксируем его выбранным,
+    # чтобы UI сразу подсветил активную карточку.
+    if k and not sel:
+        sel = k.get("id", "")
+    _set_scope_selected(settings, scope, sel)
+    return settings
+
+
+def sync_custom_api_key(settings):
+    """Вкладка Claude Code: зеркалирует активный ключ активного Base URL
+    в custom_api_key (код запуска читает именно его)."""
+    return sync_scope_key(settings, "cc")
+
+
+def sync_openai_api_key(settings):
+    """Вкладка OpenAI: зеркалирует активный ключ активного Base URL
+    в openai_api_key (его читает запись конфига Codex)."""
+    return sync_scope_key(settings, "oa")
 
 def _first_active_key(keys, sel_id):
     """Активный ключ из произвольного списка (Приоритет: выбранный по id)."""
@@ -1071,30 +1185,22 @@ def _first_active_key(keys, sel_id):
 
 def first_active_key(settings):
     """Активный ключ Anthropic/OpenAI, который реально пойдёт в ANTHROPIC_API_KEY.
-    Приоритет: явно выбранный пользователем (selected_key_id), если он
-    пригоден; иначе — первый пригодный по порядку. «Пригодный» = зелёный."""
-    return _first_active_key(settings.get("api_keys", []),
-                             settings.get("selected_key_id") or "")
+    Только ключи активного Base URL. Приоритет: явно выбранный пользователем
+    для этого URL, если он пригоден; иначе — первый пригодный по порядку.
+    «Пригодный» = зелёный."""
+    return _first_active_key(scope_keys(settings, "cc"),
+                             scope_selected_id(settings, "cc"))
 
 def first_active_oc_key(settings):
-    """Активный ключ вкладки Custom URL (отдельное хранилище oc_keys).
-    Та же логика приоритета, но по своему selected_key_id."""
-    return _first_active_key(settings.get("oc_keys", []),
-                             settings.get("oc_selected_key_id") or "")
+    """Активный ключ вкладки Custom URL (отдельное хранилище oc_keys),
+    только среди ключей активного Base URL."""
+    return _first_active_key(scope_keys(settings, "oc"),
+                             scope_selected_id(settings, "oc"))
 
 def sync_oc_api_key(settings):
     """Зеркалирует значение активного ключа вкладки Custom URL в oc_api_key
-    (код запуска opencode читает именно oc_api_key). Заодно чистит
-    устаревший oc_selected_key_id, если такого ключа больше нет."""
-    keys = settings.get("oc_keys", [])
-    ids = {k.get("id") for k in keys}
-    if settings.get("oc_selected_key_id") and settings["oc_selected_key_id"] not in ids:
-        settings["oc_selected_key_id"] = ""
-    k = first_active_oc_key(settings)
-    settings["oc_api_key"] = k.get("value", "") if k else ""
-    if k and not settings.get("oc_selected_key_id"):
-        settings["oc_selected_key_id"] = k.get("id", "")
-    return settings
+    (код запуска opencode читает именно oc_api_key)."""
+    return sync_scope_key(settings, "oc")
 
 def _normalize_key_list(keys):
     """Приводит список сырых ключей к нормальному dict-виду (общий для
@@ -1130,7 +1236,7 @@ def _normalize_key_list(keys):
             except (TypeError, ValueError):
                 return float(default)
 
-        norm.append({
+        entry = {
             "id": k.get("id") or _new_key_id(),
             "name": (k.get("name") or "Ключ").strip() or "Ключ",
             "value": val,
@@ -1141,7 +1247,12 @@ def _normalize_key_list(keys):
             "created_at": _num("created_at") or _num("activated_at") or time.time(),
             "limit_type": limit_type if not enabled else "",
             "resets_at": resets_at if not enabled else 0,
-        })
+        }
+        # Привязка к провайдеру (Base URL). Нет поля — ключ ещё не привязан
+        # (старый файл): его закрепит миграция за текущим URL вкладки.
+        if isinstance(k.get("base_url"), str):
+            entry["base_url"] = k["base_url"].strip()
+        norm.append(entry)
     return norm
 
 def migrate_api_keys(settings):
@@ -1160,18 +1271,142 @@ def migrate_api_keys(settings):
                 "enabled": True,
                 "activated_at": time.time(),
             }]
-    settings["api_keys"] = _normalize_key_list(keys)
-    sync_custom_api_key(settings)
+    settings["api_keys"] = keys
+    _migrate_scope_keys(settings, "cc")
     return settings
 
 def migrate_oc_keys(settings):
     """Приводит settings["oc_keys"] (отдельное хранилище ключей вкладки
-    Custom URL) к нормальному виду."""
-    keys = settings.get("oc_keys")
-    if not isinstance(keys, list):
-        keys = []
-    settings["oc_keys"] = _normalize_key_list(keys)
-    sync_oc_api_key(settings)
+    Custom URL) к нормальному виду и привязывает ключи к Base URL."""
+    _migrate_scope_keys(settings, "oc")
+    return settings
+
+def migrate_openai_keys(settings):
+    """Приводит settings["openai_keys"] (ключи вкладки OpenAI) к нормальному
+    виду и привязывает ключи к Base URL."""
+    _migrate_scope_keys(settings, "oa")
+    return settings
+
+def _migrate_scope_keys(settings, scope):
+    """Нормализует список ключей области, закрепляет ключи без base_url за
+    ТЕКУЩИМ Base URL вкладки (старые файлы) и переносит старый одиночный
+    выбор ключа в карту «выбор по URL»."""
+    cfg = _KEY_SCOPES[scope]
+    keys = settings.get(cfg["keys"])
+    keys = _normalize_key_list(keys if isinstance(keys, list) else [])
+    url_raw = (settings.get(cfg["url"]) or "").strip()
+    for k in keys:
+        if "base_url" not in k:
+            k["base_url"] = url_raw
+    settings[cfg["keys"]] = keys
+    if not isinstance(settings.get(cfg["sel_map"]), dict):
+        settings[cfg["sel_map"]] = {}
+    url = norm_provider_url(url_raw)
+    legacy = settings.get(cfg["sel"]) or ""
+    if (legacy and url not in settings[cfg["sel_map"]]
+            and any(k.get("id") == legacy and norm_provider_url(k.get("base_url")) == url
+                    for k in keys)):
+        settings[cfg["sel_map"]][url] = legacy
+    sync_scope_key(settings, scope)
+    return settings
+
+
+# ── Модели по провайдерам ──────────────────────────────────────────────
+# settings["custom_models"] — ЗЕРКАЛО списка своих моделей активного Base URL
+# вкладки Claude Code (весь код читает/правит его как раньше). Истина —
+# settings["custom_models_by_url"][url]; зеркало складывается обратно в
+# save_settings, а при смене URL — через switch_cc_url.
+
+def fold_cc_models(settings):
+    """custom_models (активный URL) → custom_models_by_url."""
+    if not isinstance(settings, dict):
+        return settings
+    by = settings.get("custom_models_by_url")
+    if not isinstance(by, dict):
+        by = {}
+    lst = settings.get("custom_models")
+    if isinstance(lst, list):
+        url = _scope_url(settings, "cc")
+        if lst:
+            by[url] = list(lst)
+        else:
+            by.pop(url, None)
+    settings["custom_models_by_url"] = by
+    return settings
+
+def load_cc_models(settings):
+    """custom_models_by_url[активный URL] → зеркало custom_models."""
+    by = settings.get("custom_models_by_url")
+    lst = by.get(_scope_url(settings, "cc")) if isinstance(by, dict) else None
+    settings["custom_models"] = list(lst) if isinstance(lst, list) else []
+    return settings
+
+def switch_cc_url(settings, new_url):
+    """Меняет активный Base URL Claude Code: свои модели старого провайдера
+    уходят в его запись, подгружаются модели нового."""
+    fold_cc_models(settings)           # пока URL ещё старый
+    settings["custom_base_url"] = new_url
+    load_cc_models(settings)
+    return settings
+
+def openai_custom_models(settings):
+    """Свои модели вкладки OpenAI для активного Base URL."""
+    by = settings.get("openai_custom_models_by_url")
+    lst = by.get(_scope_url(settings, "oa")) if isinstance(by, dict) else None
+    return [m for m in (lst or []) if isinstance(m, str) and m.strip()]
+
+def migrate_provider_scoping(settings):
+    """Одноразовый переход на «у каждого провайдера (Base URL) свои ключи
+    и модели» (флаг provider_scoped_v1). Ничего не теряет:
+    • ключи Claude Code/Custom URL закрепляются за текущим URL вкладки
+      (это делают migrate_api_keys / migrate_oc_keys);
+    • OpenAI раньше делила ключи с Claude Code — копируем их в openai_keys
+      под текущий openai_base_url, чтобы вкладка осталась рабочей;
+    • свои модели закрепляются за текущим URL Claude Code; выбранная
+      на вкладке OpenAI своя модель остаётся доступной.
+    Вызывать ПОСЛЕ migrate_api_keys и ДО migrate_openai_keys."""
+    if not settings.get("provider_scoped_v1"):
+        cc_url = _scope_url(settings, "cc")
+        by = settings.get("custom_models_by_url")
+        if not isinstance(by, dict):
+            by = {}
+        customs = [m for m in (settings.get("custom_models") or [])
+                   if isinstance(m, str) and m.strip()]
+        if customs and cc_url not in by:
+            by[cc_url] = list(customs)
+        settings["custom_models_by_url"] = by
+
+        om = (settings.get("openai_model") or "").strip()
+        if om and om not in OPENAI_MODEL_ORDER and om in customs:
+            oaby = settings.get("openai_custom_models_by_url")
+            if not isinstance(oaby, dict):
+                oaby = {}
+            lst = oaby.setdefault(_scope_url(settings, "oa"), [])
+            if om not in lst:
+                lst.append(om)
+            settings["openai_custom_models_by_url"] = oaby
+
+        oa_keys = settings.get("openai_keys")
+        src = settings.get("api_keys")
+        if (not isinstance(oa_keys, list) or not oa_keys) and isinstance(src, list) and src:
+            oa_url = (settings.get("openai_base_url") or "").strip()
+            old_sel = settings.get("selected_key_id") or ""
+            used, copies, new_sel = set(), [], ""
+            for k in _normalize_key_list(src):
+                nid = _new_key_id()
+                while nid in used:
+                    nid = _new_key_id()
+                used.add(nid)
+                if k.get("id") == old_sel:
+                    new_sel = nid
+                c = dict(k)
+                c["id"] = nid
+                c["base_url"] = oa_url
+                copies.append(c)
+            settings["openai_keys"] = copies
+            settings["openai_selected_key_id"] = new_sel
+        settings["provider_scoped_v1"] = True
+    load_cc_models(settings)
     return settings
 
 
@@ -39055,7 +39290,7 @@ class ClaudeManager(QMainWindow):
                 self.oa_model_combo.setItemData(i, oa_model_colors[txt], Qt.ForegroundRole)
         self.oa_model_combo.set_picker(colors=oa_model_colors, title=tr("Выбор модели"))
         saved_oa_model = self.settings.get("openai_model") or "gpt-5.6-sol"
-        customs = self.settings.get("custom_models", []) or []
+        customs = openai_custom_models(self.settings)  # свои модели ТОЛЬКО активного OpenAI-провайдера
         for cm in customs:
             if cm and cm not in OPENAI_MODEL_ORDER:
                 self.oa_model_combo.addItem(cm)
@@ -39937,11 +40172,12 @@ class ClaudeManager(QMainWindow):
         dlg.exec()
 
     def _sync_openai_combo_items(self):
-        """Синхронизирует комбобокс OpenAI/Codex с кастомными моделями."""
+        """Синхронизирует комбобокс OpenAI/Codex со своими моделями активного
+        OpenAI Base URL (модели Claude Code сюда не попадают)."""
         if not hasattr(self, "oa_model_combo"):
             return
         cur = self.settings.get("openai_model") or self.oa_model_combo.currentText()
-        customs = self.settings.get("custom_models", []) or []
+        customs = openai_custom_models(self.settings)
         items = list(OPENAI_MODEL_ORDER)
         for m in customs:
             if m and m not in items:
@@ -40197,24 +40433,27 @@ class ClaudeManager(QMainWindow):
         Base URL принадлежит freemodel.dev; во всех остальных случаях лимит
         ставится обратным отсчётом, как в Custom URL."""
         self._open_shared_key_manager(self._is_freemodel_endpoint(
-            self.settings.get("custom_base_url", "")))
+            self.settings.get("custom_base_url", "")), "cc")
 
     def _oa_manage_keys(self):
-        """То же окно управления, но для вкладки OpenAI: freemodel-логика
-        включается по СВОЕМУ openai_base_url (не путать с Anthropic-URL)."""
+        """То же окно управления, но для вкладки OpenAI: свои ключи (openai_keys)
+        и freemodel-логика по СВОЕМУ openai_base_url (не путать с Anthropic-URL)."""
         self._open_shared_key_manager(self._is_freemodel_endpoint(
-            self.settings.get("openai_base_url", "")))
+            self.settings.get("openai_base_url", "")), "oa")
 
-    def _open_shared_key_manager(self, is_freemodel):
-        """Общая реализация Для вкладок Anthropic/OpenAI: открывает
-        ApiKeyManagerDialog над общим хранилищем api_keys, пока диалог жив —
-        любое изменение сбрасывается на диск через _persist_key_state."""
+    def _open_shared_key_manager(self, is_freemodel, scope="cc"):
+        """Общая реализация для вкладок Anthropic (scope 'cc') и OpenAI ('oa'):
+        открывает ApiKeyManagerDialog ТОЛЬКО с ключами активного Base URL этой
+        вкладки; ключи других провайдеров окно не видит и не затрагивает.
+        Пока диалог жив — любое изменение сбрасывается на диск через
+        _persist_key_state."""
         dlg = ApiKeyManagerDialog(
-            self.settings.get("api_keys", []),
-            selected_id=self.settings.get("selected_key_id", ""),
+            scope_keys(self.settings, scope),
+            selected_id=scope_selected_id(self.settings, scope),
             parent=self,
             is_freemodel=is_freemodel,
         )
+        dlg._scope = scope
         # Пока диалог открыт, любая мутация ключа (клик тумблера, авто-сброс
         # таймера лимита) должна тут же сохраняться на диск,
         # чтобы состояние переживало неожиданное закрытие приложения — но БЕЗ
@@ -40225,20 +40464,20 @@ class ClaudeManager(QMainWindow):
         dlg.keys_data_changed.connect(lambda: self._persist_key_state(dlg, with_backup=True))
         dlg.exec()
         keys, selected_id = dlg.get_result()
-        self.settings["api_keys"] = keys
-        self.settings["selected_key_id"] = selected_id
-        sync_custom_api_key(self.settings)
+        merge_scope_keys(self.settings, scope, keys, selected_id)
+        sync_scope_key(self.settings, scope)
         # Финальное сохранение при закрытии окна — БЕЗ бэкапа. Все важные
         # изменения уже вызвали свой .bakN во время работы диалога.
         save_settings(self.settings)
         self._refresh_active_key_display()
         # Активный ключ мог смениться — обновим модель в ~/.claude/settings.json
-        try:
-            current_model = self.fm_model_combo.currentText() if hasattr(self, "fm_model_combo") else self.settings.get("custom_model", "")
-            if current_model:
-                self._write_claude_model_setting(current_model)
-        except Exception:
-            pass
+        if scope == "cc":
+            try:
+                current_model = self.fm_model_combo.currentText() if hasattr(self, "fm_model_combo") else self.settings.get("custom_model", "")
+                if current_model:
+                    self._write_claude_model_setting(current_model)
+            except Exception:
+                pass
 
     def _persist_key_state(self, dlg, with_backup=False):
         """Слот сигнала ApiKeyManagerDialog: подхватывает текущее состояние
@@ -40251,9 +40490,9 @@ class ClaudeManager(QMainWindow):
         (toggle, reorder), пишет без бэкапа."""
         try:
             keys, selected_id = dlg.get_result()
-            self.settings["api_keys"] = keys
-            self.settings["selected_key_id"] = selected_id
-            sync_custom_api_key(self.settings)
+            scope = getattr(dlg, "_scope", "cc")
+            merge_scope_keys(self.settings, scope, keys, selected_id)
+            sync_scope_key(self.settings, scope)
             if with_backup:
                 save_settings_with_backup(self.settings)
             else:
@@ -40269,8 +40508,8 @@ class ClaudeManager(QMainWindow):
         ОБРАТНЫЙ ОТСЧЁТ (KeyLimitDurationDialog), без точного времени
         сброса freemodel.dev."""
         dlg = ApiKeyManagerDialog(
-            self.settings.get("oc_keys", []),
-            selected_id=self.settings.get("oc_selected_key_id", ""),
+            scope_keys(self.settings, "oc"),
+            selected_id=scope_selected_id(self.settings, "oc"),
             parent=self,
             is_freemodel=False,
         )
@@ -40278,8 +40517,7 @@ class ClaudeManager(QMainWindow):
         dlg.keys_data_changed.connect(lambda: self._persist_oc_key_state(dlg, with_backup=True))
         dlg.exec()
         keys, selected_id = dlg.get_result()
-        self.settings["oc_keys"] = keys
-        self.settings["oc_selected_key_id"] = selected_id
+        merge_scope_keys(self.settings, "oc", keys, selected_id)
         sync_oc_api_key(self.settings)
         save_settings(self.settings)
         self._refresh_active_key_display()
@@ -40290,8 +40528,7 @@ class ClaudeManager(QMainWindow):
         с with_backup=True снимает .bakN бэкап, иначе — без бэкапа."""
         try:
             keys, selected_id = dlg.get_result()
-            self.settings["oc_keys"] = keys
-            self.settings["oc_selected_key_id"] = selected_id
+            merge_scope_keys(self.settings, "oc", keys, selected_id)
             sync_oc_api_key(self.settings)
             if with_backup:
                 save_settings_with_backup(self.settings)
@@ -40310,10 +40547,10 @@ class ClaudeManager(QMainWindow):
             self.fm_key_input.setText(val)
         if hasattr(self, "fm_btn_toggle_key") and hasattr(self.fm_btn_toggle_key, "setRevealed"):
             self.fm_btn_toggle_key.setRevealed(False)
-        # Ключи общие — зеркалим и в поле вкладки OpenAI
+        # У вкладки OpenAI свои ключи (openai_keys) — в её поле только они.
         if hasattr(self, "oa_key_input"):
             self.oa_key_input.setEchoMode(QLineEdit.Password)
-            self.oa_key_input.setText(val)
+            self.oa_key_input.setText(self.settings.get("openai_api_key", ""))
         if hasattr(self, "oa_btn_toggle_key") and hasattr(self.oa_btn_toggle_key, "setRevealed"):
             self.oa_btn_toggle_key.setRevealed(False)
         # Ключи вкладки Custom URL — отдельное хранилище (oc_api_key)
@@ -40346,11 +40583,17 @@ class ClaudeManager(QMainWindow):
         try:
             new_urls, new_current = dlg.get_result()
             self.settings["custom_base_urls"] = list(new_urls)
-            self.settings["custom_base_url"] = new_current
+            # switch_cc_url: модели старого провайдера уходят в его запись,
+            # подгружаются модели нового; ключи берутся по новому URL.
+            switch_cc_url(self.settings, new_current)
+            sync_scope_key(self.settings, "cc")
             save_settings(self.settings)
             if hasattr(self, "fm_url_input"):
                 if self.fm_url_input.text() != new_current:
                     self.fm_url_input.setText(new_current)
+            self._refresh_active_key_display()
+            self._sync_custom_combo_items()
+            self._sync_openai_combo_items()
             # Обновляем видимость бейджа freemodel.dev (если удалили текущий
             # URL и фолбэкнулись на freemodel, бейдж должен вернуться).
             self._refresh_freemodel_brand_visibility()
@@ -40379,10 +40622,13 @@ class ClaudeManager(QMainWindow):
             new_urls, new_current = dlg.get_result()
             self.settings["openai_base_urls"] = list(new_urls)
             self.settings["openai_base_url"] = new_current
+            sync_scope_key(self.settings, "oa")
             save_settings(self.settings)
             if hasattr(self, "oa_url_input"):
                 if self.oa_url_input.text() != new_current:
                     self.oa_url_input.setText(new_current)
+            self._refresh_active_key_display()
+            self._sync_openai_combo_items()
             self._refresh_freemodel_brand_visibility()
         except Exception as e:
             print(f"[_persist_oa_url_state] Не удалось сохранить: {e}")
@@ -40421,10 +40667,12 @@ class ClaudeManager(QMainWindow):
             prev = self.settings.get("oc_base_url", "")
             self.settings["oc_base_urls"] = list(new_urls)
             self.settings["oc_base_url"] = new_current
+            sync_scope_key(self.settings, "oc")
             save_settings(self.settings)
             if hasattr(self, "oc_url_input"):
                 if self.oc_url_input.text() != new_current:
                     self.oc_url_input.setText(new_current)
+            self._refresh_active_key_display()
             if new_current != prev:
                 if new_current:
                     self.log(tr("Base URL {} сохранён").format(new_current), "success")
@@ -41986,8 +42234,8 @@ class ClaudeManager(QMainWindow):
         """Пишет ~/.codex/auth.json и config.toml под выбранные ключ/URL/модель/effort.
         Возвращает True при успехе."""
         try:
-            sync_custom_api_key(self.settings)
-            api_key = self.settings.get("custom_api_key", "")
+            sync_openai_api_key(self.settings)
+            api_key = self.settings.get("openai_api_key", "")
             if not api_key:
                 self.log("Нет активного API ключа — включите ключ в окне «Управление»", "error")
                 return False
