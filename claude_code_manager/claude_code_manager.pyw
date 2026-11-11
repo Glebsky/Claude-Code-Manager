@@ -1420,6 +1420,9 @@ def migrate_provider_scoping(settings):
 
 TRANSLATIONS_UA = {
     "Получить": "Отримати",
+    "Очистить список моделей текущего провайдера — модели можно получить заново кнопкой «Получить»": "Очистити список моделей поточного провайдера — моделі можна отримати знову кнопкою «Отримати»",
+    "Список моделей текущего провайдера уже пуст": "Список моделей поточного провайдера вже порожній",
+    "Список моделей очищен ({}) — получите модели заново": "Список моделей очищено ({}) — отримайте моделі заново",
     "Загрузка...": "Завантаження...",
     "С сервера": "З сервера",
     "Получить с сервера": "Отримати з сервера",
@@ -1995,6 +1998,9 @@ TRANSLATIONS_UA = {
 TRANSLATIONS = {
     # ── Модели и анимация
     "Получить": "Fetch",
+    "Очистить список моделей текущего провайдера — модели можно получить заново кнопкой «Получить»": "Clear the current provider's model list — fetch the models again with Fetch",
+    "Список моделей текущего провайдера уже пуст": "The current provider's model list is already empty",
+    "Список моделей очищен ({}) — получите модели заново": "Model list cleared ({}) — fetch the models again",
     "Загрузка...": "Loading...",
     "С сервера": "From server",
     "Получить с сервера": "Fetch from server",
@@ -39142,6 +39148,17 @@ class ClaudeManager(QMainWindow):
         self.fm_btn_fetch_models.clicked.connect(self._fm_fetch_models)
         model_row.addWidget(self.fm_btn_fetch_models)
 
+        # Очистить список моделей АКТИВНОГО провайдера (Base URL): списки
+        # других провайдеров не затрагиваются — custom_models это зеркало
+        # активного URL, save_settings складывает его в custom_models_by_url.
+        self.fm_btn_clear_models = StyledButton(tr("Очистить"), compact=True)
+        self.fm_btn_clear_models.setToolTip(tr("Очистить список моделей текущего провайдера — модели можно получить заново кнопкой «Получить»"))
+        self.fm_btn_clear_models.setFixedHeight(36)
+        self.fm_btn_clear_models.setFixedWidth(100)
+        self.fm_btn_clear_models.set_hover_color(210, 90, 90)
+        self.fm_btn_clear_models.clicked.connect(self._fm_clear_models)
+        model_row.addWidget(self.fm_btn_clear_models)
+
         self.fm_btn_model_roles = StyledButton(tr("Роли"), compact=True)
         self.fm_btn_model_roles.setToolTip(tr("Настройка связки и ролей моделей (Haiku / Sonnet / Opus / Custom) для Claude Code и агентов"))
         self.fm_btn_model_roles.setFixedHeight(36)
@@ -39856,6 +39873,22 @@ class ClaudeManager(QMainWindow):
         fetcher.models_fetched.connect(_on_models_fetched)
         self._fm_fetcher = fetcher
         fetcher.start()
+
+    def _fm_clear_models(self):
+        """Очищает список моделей активного провайдера (Base URL), чтобы
+        получить их заново кнопкой «Получить». custom_models — зеркало списка
+        СВОИХ моделей активного Base URL: save_settings (fold_cc_models)
+        складывает пустой список в custom_models_by_url именно активного URL,
+        поэтому записи других провайдеров не затрагиваются."""
+        customs = self.settings.get("custom_models", []) or []
+        if not customs:
+            self.log(tr("Список моделей текущего провайдера уже пуст"), "info")
+            return
+        self.settings["custom_models"] = []
+        save_settings(self.settings)
+        self._sync_custom_combo_items()
+        self._sync_openai_combo_items()
+        self.log(tr("Список моделей очищен ({}) — получите модели заново").format(len(customs)), "info")
 
     def _ensure_claude_custom_api_key_approved(self, api_key):
         """Добавляет API-ключ в approved-список ~/.claude.json, чтобы Claude Code
