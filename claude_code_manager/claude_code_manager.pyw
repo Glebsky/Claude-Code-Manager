@@ -28029,6 +28029,7 @@ class OcModelDialog(QDialog):
         # секции). Даты «когда добавлено» приходят прямо в мете моделей
         # из каталога opencode (released), локально не хранятся.
         self._set_free_maps(free_removed)
+        self._active_provider = None  # None = показывать все провайдеры
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 14, 14, 14)
@@ -28124,6 +28125,20 @@ class OcModelDialog(QDialog):
         search_row.addWidget(self.refresh_btn)
         inner.addLayout(search_row)
 
+        # Строка фильтра по провайдерам: появляется только когда endpoint
+        # содержит модели от нескольких провайдеров (ID вида prov/model).
+        self._prov_filter_row = QWidget()
+        self._prov_filter_row.setStyleSheet(
+            "background: transparent; border: none;")
+        _pfl = QHBoxLayout(self._prov_filter_row)
+        _pfl.setContentsMargins(0, 0, 0, 2)
+        _pfl.setSpacing(5)
+        _pfl.addStretch(1)
+        _pfl.addStretch(1)
+        self._prov_chips_layout = _pfl
+        inner.addWidget(self._prov_filter_row)
+        self._prov_filter_row.hide()
+
         self._cards_host = QWidget()
         self._cards_host.setStyleSheet("background: transparent; border: none;")
         self._cards_layout = QVBoxLayout(self._cards_host)
@@ -28171,6 +28186,7 @@ class OcModelDialog(QDialog):
         self._notice_expiry_timer.setSingleShot(True)
         self._notice_expiry_timer.timeout.connect(self._on_notice_expiry)
 
+        self._rebuild_provider_chips()
         self._build_sections()
 
         # Авто-подстройка размера: растёт под контент, но ограничен максимумами
@@ -28672,6 +28688,7 @@ class OcModelDialog(QDialog):
         if model_meta is not None:
             self._meta = _oc_normalize_meta_map(model_meta)
         self._set_free_maps(free_removed)
+        self._rebuild_provider_chips()
         self._clear_cards()
         self._build_sections()
         self._scroll.setMaximumHeight(self.MAX_H - 231)
@@ -28718,6 +28735,88 @@ class OcModelDialog(QDialog):
     BUILD_SYNC_MAX = 30
     BUILD_SLICE_MS = 12.0
 
+    def _rebuild_provider_chips(self):
+        """Пересобирает кнопки-чипы фильтра провайдеров.
+
+        Появляются только когда endpoint содержит модели
+        от нескольких провайдеров (prefix/model).
+        """
+        pfl = getattr(self, '_prov_chips_layout', None)
+        row = getattr(self, '_prov_filter_row', None)
+        if pfl is None or row is None:
+            return
+        # Убираем старые чипы (оставляем два stretch-а)
+        while pfl.count() > 2:
+            item = pfl.takeAt(1)
+            w = item.widget() if item else None
+            if w:
+                w.deleteLater()
+        # Собираем уникальные провайдеры из endpoint
+        provs = []
+        seen = set()
+        for mid in (self._endpoint or []):
+            p = str(mid).split('/')[0].strip() if '/' in str(mid) else ''
+            if p and p not in seen:
+                seen.add(p)
+                provs.append(p)
+        if len(provs) < 2:
+            self._active_provider = None
+            row.hide()
+            return
+        # Сбрасываем активный провайдер если его больше нет
+        if self._active_provider not in provs:
+            self._active_provider = None
+        _chip_base = (
+            "QPushButton {"
+            " background: rgba(60,60,70,180);"
+            " color: rgb(180,180,192);"
+            " border: 1px solid rgb(70,70,80);"
+            " border-radius: 10px;"
+            " padding: 2px 10px;"
+            " font-size: 9pt; }"
+            "QPushButton:hover {"
+            " background: rgba(80,80,95,220);"
+            " color: #ececf1; }"
+        )
+        _chip_active = (
+            "QPushButton {"
+            " background: rgba(100,100,220,200);"
+            " color: #ffffff;"
+            " border: 1px solid rgb(120,120,230);"
+            " border-radius: 10px;"
+            " padding: 2px 10px;"
+            " font-size: 9pt; font-weight: bold; }"
+        )
+        def _make_chip(label, prov_val):
+            btn = QPushButton(label)
+            btn.setFlat(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(22)
+            active = (self._active_provider == prov_val)
+            btn.setStyleSheet(_chip_active if active else _chip_base)
+            def _click(checked=False, _p=prov_val):
+                self._set_provider_filter(_p)
+            btn.clicked.connect(_click)
+            return btn
+        insert_at = pfl.count() - 1
+        all_btn = _make_chip(tr("Все"), None)
+        pfl.insertWidget(insert_at, all_btn)
+        insert_at += 1
+        for p in provs:
+            btn = _make_chip(p, p)
+            pfl.insertWidget(insert_at, btn)
+            insert_at += 1
+        row.show()
+
+    def _set_provider_filter(self, prov):
+        """Устанавливает активный провайдер-фильтр и перестраивает список."""
+        self._active_provider = prov
+        self._rebuild_provider_chips()
+        scroll_pos = self._scroll.verticalScrollBar().value()
+        self._clear_cards()
+        self._build_sections()
+        self._scroll.verticalScrollBar().setValue(scroll_pos)
+
     def _clear_cards(self):
         """Убирает из layout старые карточки/плашки перед пересборкой."""
         while self._cards_layout.count():
@@ -28728,7 +28827,16 @@ class OcModelDialog(QDialog):
                 w.deleteLater()
 
     def _build_sections(self):
-        combined = self._endpoint + self._free
+        # Фильтрация по активному провайдеру (None = все).
+        ap = getattr(self, '_active_provider', None)
+        if ap:
+            _shown_endpoint = [
+                m for m in self._endpoint
+                if str(m).split('/')[0].strip().lower() == ap.lower()
+            ]
+        else:
+            _shown_endpoint = list(self._endpoint)
+        combined = _shown_endpoint + self._free
         # Коллекции живого поиска пересобираются вместе со списком:
         # _add_section_header кладёт шапку, _add_row — строки секции.
         self._filter_sections = []
@@ -28743,16 +28851,16 @@ class OcModelDialog(QDialog):
             # Общая плашка изменений (добавленные + удалённые) — под шапкой.
             queue.append(("notices", (self._free_removed, self._free)))
             queue.extend(("row", (m, True)) for m in self._free)
-        if self._endpoint:
+        if _shown_endpoint:
             queue.append(("header", (tr("Модели провайдера"),
-                                     len(self._endpoint),
+                                     len(_shown_endpoint),
                                      self._provider_name, "")))
             # Все строки провайдера — вендорного цвета; зелёная окраска
             # только у секции «Бесплатные модели». Явная
             # группировка: базовое имя модели (первые два слова ID)
             # задаёт блок по алфавиту, внутри блока — порядок эндпоинта;
             # каждое семейство получает свой подзаголовок с точкой.
-            grouped = sorted(self._endpoint, key=_oc_model_group_key)
+            grouped = sorted(_shown_endpoint, key=_oc_model_group_key)
             i = 0
             while i < len(grouped):
                 fam = _oc_model_color_key(grouped[i])
