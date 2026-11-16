@@ -1,4 +1,4 @@
-"""
+﻿"""
 =====================================================
  Claude Code Manager ― PySide6 Edition
  ──────────── Управление Claude Code, opencode и Base URL
@@ -14,7 +14,7 @@ AUTHOR_DISCORD = ""
 AUTHOR_GITHUB = "https://github.com/Glebsky/Claude-Code-Manager"
 AUTHOR_TELEGRAM = ""
 APP_SITE_URL = ""
-import sys, subprocess, os, threading, time, json, socket, math, ssl, random, shutil, re, calendar, tempfile
+import sys, subprocess, os, threading, time, json, socket, math, ssl, random, shutil, re, calendar, tempfile, secrets
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
@@ -1005,7 +1005,8 @@ def fm_next_date_epoch(month, day, h24, m, s, now=None):
     return float(target)
 
 def _new_key_id():
-    return f"k{int(time.time() * 1000)}{random.randint(1000, 9999)}"
+    # SEC-03: используем secrets вместо random для криптостойкой уникальности ID
+    return f"k{int(time.time() * 1000)}{secrets.token_hex(4)}"
 
 def key_expired(key):
     """True, если у выключенного ключа истёк таймер лимита и его пора автовключить."""
