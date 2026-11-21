@@ -27,8 +27,8 @@ from PySide6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QText
 from PySide6.QtCore import QPointF, QRectF, QRect, QUrl, QPoint
 from PySide6.QtSvg import QSvgRenderer
 
-APP_VERSION = "6.0.8"  # Для обновлений
-APP_DISPLAY_VERSION = "1.0"  # Визуальное отображение версии
+APP_VERSION = "1.1.0"  # Для обновлений (SemVer)
+APP_DISPLAY_VERSION = "1.1"  # Визуальное отображение версии
 SETTINGS_DIR = os.path.join(os.getenv("APPDATA", os.path.expanduser("~")), "ClaudeManager")
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 # Бэкапы настроек: перед КАЖДЫМ изменением в управлении ключами (add/delete/
@@ -9022,8 +9022,9 @@ class CustomModelsWindow(QDialog):
     WIDTH = 540
     ACCENT = (145, 145, 150)
 
-    def __init__(self, models=None, selected=None, parent=None):
+    def __init__(self, models=None, selected=None, parent=None, scope="cc"):
         super().__init__(parent)
+        self._scope = scope
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
@@ -9116,7 +9117,10 @@ class CustomModelsWindow(QDialog):
 
         add_row = QHBoxLayout()
         self.model_input = QLineEdit()
-        self.model_input.setPlaceholderText(tr("Например: claude-haiku-5.5:free"))
+        if self._scope == "oa":
+            self.model_input.setPlaceholderText(tr("Например: gpt-4o"))
+        else:
+            self.model_input.setPlaceholderText(tr("Например: claude-haiku-5.5:free"))
         self.model_input.setFont(QFont("Segoe UI", 9))
         self.model_input.setStyleSheet("""
             QLineEdit {
@@ -9146,14 +9150,15 @@ class CustomModelsWindow(QDialog):
         self.btn_auto_fetch.clicked.connect(self._fetch_from_server)
         add_row.addWidget(self.btn_auto_fetch)
 
-        self.btn_roles = StyledButton(tr("Роли"), compact=True)
-        self.btn_roles.setToolTip(tr("Настройка связки и ролей моделей (Haiku / Sonnet / Opus / Custom)"))
-        self.btn_roles.set_hover_color(180, 120, 240)
-        self.btn_roles.setMinimumHeight(0)
-        self.btn_roles.setFixedHeight(36)
-        self.btn_roles.setMaximumWidth(80)
-        self.btn_roles.clicked.connect(self._open_roles_dialog)
-        add_row.addWidget(self.btn_roles)
+        if self._scope != "oa":
+            self.btn_roles = StyledButton(tr("Роли"), compact=True)
+            self.btn_roles.setToolTip(tr("Настройка связки и ролей моделей (Haiku / Sonnet / Opus / Custom)"))
+            self.btn_roles.set_hover_color(180, 120, 240)
+            self.btn_roles.setMinimumHeight(0)
+            self.btn_roles.setFixedHeight(36)
+            self.btn_roles.setMaximumWidth(80)
+            self.btn_roles.clicked.connect(self._open_roles_dialog)
+            add_row.addWidget(self.btn_roles)
 
         layout.addLayout(add_row)
         outer.addWidget(container)
@@ -9354,9 +9359,14 @@ class CustomModelsWindow(QDialog):
                 main_win = p
             if main_win is None or not hasattr(main_win, "settings"):
                 return
-            base_url = (main_win.settings.get("custom_base_url") or "").strip()
-            sync_custom_api_key(main_win.settings)
-            api_key = (main_win.settings.get("custom_api_key") or "").strip()
+            if getattr(self, "_scope", "cc") == "oa":
+                base_url = (main_win.settings.get("openai_base_url") or "").strip()
+                sync_openai_api_key(main_win.settings)
+                api_key = (main_win.settings.get("openai_api_key") or "").strip()
+            else:
+                base_url = (main_win.settings.get("custom_base_url") or "").strip()
+                sync_custom_api_key(main_win.settings)
+                api_key = (main_win.settings.get("custom_api_key") or "").strip()
             if not base_url:
                 self.empty_lbl.setText(tr("Укажите Base URL в окне «Управление»"))
                 return
@@ -9380,7 +9390,7 @@ class CustomModelsWindow(QDialog):
                         if added_any:
                             chosen = self._selected if self._selected in self._models else models[0]
                             self.set_models(self._models, selected=chosen)
-                            self._on_custom_selected(chosen)
+                            self._select(chosen)
                 except Exception:
                     pass
             fetcher.models_fetched.connect(_on_done)
@@ -10675,6 +10685,13 @@ class OptionSlider(QWidget):
             self._py, self._px = [float(v) for v in self._grid_pos(self._levels.index(value))]
         self.update()
 
+    def set_dimmed(self, on):
+        """Приглушить весь слайдер (выбрана своя модель из отдельного ряда)."""
+        on = bool(on)
+        if on != getattr(self, "_dimmed", False):
+            self._dimmed = on
+            self.update()
+
     def value(self):
         return self._level
 
@@ -10792,7 +10809,7 @@ class OptionSlider(QWidget):
         new_level = self._levels[idx]
         if new_level in self._disabled:
             return
-        if new_level != self._level:
+        if new_level != self._level or getattr(self, "_dimmed", False):
             self._level = new_level
             self._target = float(idx)
             self.changed.emit(new_level)
@@ -10827,6 +10844,8 @@ class OptionSlider(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        if getattr(self, "_dimmed", False):
+            p.setOpacity(0.45)
         w, h = self.width(), self.height()
         n = len(self._levels)
         rh = self.ROW_H
@@ -29383,17 +29402,28 @@ class _OcModelsLoader(QThread):
 
 class OpenAIModelDialog(QDialog):
     """Окно выбора модели и reasoning effort для Codex CLI (вкладка OpenAI).
-    Структура и стиль полностью повторяют ModelDialog: два ползунка + описания."""
+    Структура и стиль полностью повторяют ModelDialog: два ползунка + описания + свои модели."""
 
     applied = Signal(str, str)  # model, effort
+    custom_added = Signal(str)
+    custom_deleted = Signal(str)
 
-    def __init__(self, current_model="gpt-5.6-sol", parent=None, current_effort="low"):
+    def __init__(self, current_model="gpt-5.6-sol", parent=None, current_effort="low",
+                 custom_models=None, show_custom=True):
         super().__init__(parent)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.setModal(True)
-        if current_model not in OPENAI_MODEL_ORDER:
+        try:
+            customs = [m for m in (custom_models or [])
+                       if isinstance(m, str) and m.strip()]
+        except Exception:
+            customs = []
+        self._custom_models = list(customs) if show_custom else []
+        self._show_custom = bool(show_custom)
+        if (current_model not in OPENAI_MODEL_ORDER
+                and current_model not in self._custom_models):
             current_model = "gpt-5.6-sol"
         if current_effort not in OPENAI_EFFORT_LEVELS:
             current_effort = "low"
@@ -29488,6 +29518,26 @@ class OpenAIModelDialog(QDialog):
         self.effort_desc_lbl.setWordWrap(True)
         inner.addWidget(self.effort_desc_lbl)
 
+        # ── Свои модели (OpenAI): одна полоска (пустая — с "+"),
+        # клик — окно списка и добавления.
+        self._custom_window = None
+        strip_wrap = QHBoxLayout()
+        strip_wrap.addStretch()
+        self._custom_strip = StyledButton("+", parent=self, compact=True)
+        self._custom_strip.setFixedSize(468, 34)
+        self._custom_strip.set_hover_color(145, 145, 150)
+        self._custom_strip.setToolTip(tr("Свои модели"))
+        self._custom_strip.clicked.connect(self._open_custom_window)
+        strip_wrap.addWidget(self._custom_strip)
+        strip_wrap.addStretch()
+        inner.addLayout(strip_wrap)
+        self._refresh_custom_strip()
+
+        if self._model in self._custom_models:
+            self.desc_lbl.setText(tr("Своя модель — ID передаётся CLI как есть"))
+            self.desc_lbl.setStyleSheet(
+                "color: rgb(145, 145, 150); background: transparent; border: none;")
+
         self.setFixedWidth(560)
         self.adjustSize()
 
@@ -29527,10 +29577,159 @@ class OpenAIModelDialog(QDialog):
             f"color: rgb({r},{g},{b}); background: transparent; border: none;"
         )
 
+    def _refresh_custom_strip(self):
+        try:
+            strip = self._custom_strip
+        except Exception:
+            return
+        if strip is None:
+            return
+        try:
+            sel = (self._model if self._model in self._custom_models else None)
+            strip.setText(sel if sel else tr("Свои модели"))
+            strip.set_lit(bool(sel))
+            strip.setVisible(bool(getattr(self, "_show_custom", False)))
+        except Exception:
+            pass
+        try:
+            if hasattr(self.slider, "set_dimmed"):
+                self.slider.set_dimmed(self._model in self._custom_models)
+        except Exception:
+            pass
+
+    def _open_custom_window(self):
+        """Окно списка и добавления своих моделей (по центру OpenAIModelDialog)."""
+        if not getattr(self, "_show_custom", False):
+            return
+        try:
+            win = CustomModelsWindow(models=self._custom_models,
+                                     selected=self._model,
+                                     parent=self,
+                                     scope="oa")
+        except Exception:
+            return
+        self._custom_window = win
+        try:
+            win.picked.connect(self._on_window_picked)
+            win.model_added.connect(self._on_window_added)
+            win.model_deleted.connect(self._on_window_deleted)
+        except Exception:
+            pass
+        try:
+            win.adjustSize()
+            dw, dh = win.width(), win.height()
+            pg = self.frameGeometry()
+            center = pg.center()
+            win.move(center.x() - dw // 2, center.y() - dh // 2)
+            win._positioned = True
+        except Exception:
+            pass
+        try:
+            win.exec()
+        except Exception:
+            pass
+        self._custom_window = None
+        try:
+            self.adjustSize()
+        except Exception:
+            pass
+
+    def _on_window_picked(self, model_id):
+        self._on_custom_selected(model_id)
+
+    def _on_window_added(self, new_id):
+        if not new_id:
+            return
+        if new_id in self._custom_models:
+            self._on_custom_selected(new_id)
+            self.desc_lbl.setText(tr("Модель уже добавлена"))
+        elif new_id in OPENAI_MODEL_ORDER:
+            self._select_any_model(new_id)
+        else:
+            self._custom_models.append(new_id)
+            self._refresh_custom_strip()
+            self._on_custom_selected(new_id)
+            try:
+                self.custom_added.emit(new_id)
+            except Exception:
+                pass
+        try:
+            if self._custom_window is not None:
+                self._custom_window.set_models(self._custom_models, self._model)
+        except Exception:
+            pass
+        try:
+            self.adjustSize()
+        except Exception:
+            pass
+
+    def _on_window_deleted(self, model_id):
+        if model_id not in self._custom_models:
+            return
+        try:
+            self._custom_models.remove(model_id)
+        except Exception:
+            return
+        if self._model == model_id:
+            self._model = "gpt-5.6-sol"
+            try:
+                if hasattr(self.slider, "set_value"):
+                    self.slider.set_value("gpt-5.6-sol")
+            except Exception:
+                pass
+            self._on_slider_changed("gpt-5.6-sol")
+        self._refresh_custom_strip()
+        try:
+            if self._custom_window is not None:
+                self._custom_window.set_models(self._custom_models, self._model)
+        except Exception:
+            pass
+        try:
+            self.custom_deleted.emit(model_id)
+        except Exception:
+            pass
+        try:
+            self.adjustSize()
+        except Exception:
+            pass
+
+    def _select_any_model(self, name):
+        if name in OPENAI_MODEL_ORDER:
+            self._on_slider_changed(name)
+            try:
+                if hasattr(self.slider, "set_value"):
+                    self.slider.set_value(name)
+            except Exception:
+                pass
+        elif name in self._custom_models:
+            self._on_custom_selected(name)
+
+    def _on_custom_selected(self, model_id):
+        if model_id not in self._custom_models:
+            return
+        self._model = model_id
+        try:
+            if hasattr(self.slider, "set_dimmed"):
+                self.slider.set_dimmed(True)
+        except Exception:
+            pass
+        self._refresh_custom_strip()
+        self.desc_lbl.setText(tr("Своя модель — ID передаётся CLI как есть"))
+        self.desc_lbl.setStyleSheet(
+            "color: rgb(145, 145, 150); background: transparent; border: none;")
+        if hasattr(self, "effort_slider") and hasattr(self.effort_slider, "set_disabled_levels"):
+            self.effort_slider.set_disabled_levels([])
+
     def _on_slider_changed(self, model):
         self._model = model
         self.desc_lbl.setText(self._desc_text(model))
         self._apply_desc_color(model)
+        try:
+            if hasattr(self.slider, "set_dimmed"):
+                self.slider.set_dimmed(False)
+        except Exception:
+            pass
+        self._refresh_custom_strip()
         # обновляем список запрещённых effort'ов; если текущий effort
         # оказался запрещён — OptionSlider сам сдвинет его и вызовет
         # changed → _on_effort_slider_changed, что обновит self._effort/desc.
@@ -29570,18 +29769,20 @@ class OpenAIModelDialog(QDialog):
             self.close()
             return
         if event.key() == Qt.Key_Left:
-            i = OPENAI_MODEL_ORDER.index(self._model)
-            if i > 0:
-                new_m = OPENAI_MODEL_ORDER[i - 1]
-                self._on_slider_changed(new_m)
-                self.slider.set_value(new_m)
+            if self._model in OPENAI_MODEL_ORDER:
+                i = OPENAI_MODEL_ORDER.index(self._model)
+                if i > 0:
+                    new_m = OPENAI_MODEL_ORDER[i - 1]
+                    self._on_slider_changed(new_m)
+                    self.slider.set_value(new_m)
             return
         if event.key() == Qt.Key_Right:
-            i = OPENAI_MODEL_ORDER.index(self._model)
-            if i < len(OPENAI_MODEL_ORDER) - 1:
-                new_m = OPENAI_MODEL_ORDER[i + 1]
-                self._on_slider_changed(new_m)
-                self.slider.set_value(new_m)
+            if self._model in OPENAI_MODEL_ORDER:
+                i = OPENAI_MODEL_ORDER.index(self._model)
+                if i < len(OPENAI_MODEL_ORDER) - 1:
+                    new_m = OPENAI_MODEL_ORDER[i + 1]
+                    self._on_slider_changed(new_m)
+                    self.slider.set_value(new_m)
             return
         super().keyPressEvent(event)
 
@@ -29591,12 +29792,34 @@ class OpenAIModelPickerComboBox(PickerComboBox):
     с ползунками модели и effort'а."""
 
     modelEffortPicked = Signal(str, str)
+    custom_added = Signal(str)
+    custom_deleted = Signal(str)
+
+    def _on_custom_added(self, model_id):
+        try:
+            self.custom_added.emit(model_id)
+        except Exception:
+            pass
+
+    def _on_custom_deleted(self, model_id):
+        try:
+            self.custom_deleted.emit(model_id)
+        except Exception:
+            pass
 
     def showPopup(self):
         if self._picker_dlg is not None:
             return
         cur = self.currentText()
-        if cur not in OPENAI_MODEL_ORDER:
+        customs = []
+        try:
+            parent_win = self.window()
+            if parent_win is not None and hasattr(parent_win, "settings"):
+                raw = openai_custom_models(parent_win.settings)
+                customs = [m for m in raw if isinstance(m, str) and m.strip()]
+        except Exception:
+            pass
+        if cur not in OPENAI_MODEL_ORDER and cur not in customs:
             cur = "gpt-5.6-sol"
         current_effort = "low"
         try:
@@ -29607,8 +29830,12 @@ class OpenAIModelPickerComboBox(PickerComboBox):
                     current_effort = eff
         except Exception:
             pass
-        dlg = OpenAIModelDialog(current_model=cur, parent=self.window(), current_effort=current_effort)
+        dlg = OpenAIModelDialog(current_model=cur, parent=self.window(),
+                                current_effort=current_effort,
+                                custom_models=customs, show_custom=True)
         dlg.applied.connect(self._on_model_effort_picked)
+        dlg.custom_added.connect(self._on_custom_added)
+        dlg.custom_deleted.connect(self._on_custom_deleted)
         dlg.destroyed.connect(self._on_picker_destroyed)
         self._picker_dlg = dlg
 
@@ -39325,7 +39552,32 @@ class ClaudeManager(QMainWindow):
             self.oa_model_combo.modelEffortPicked.connect(self._on_oa_model_effort_picked)
         except Exception:
             pass
+        try:
+            self.oa_model_combo.custom_added.connect(self._on_oa_custom_added)
+        except Exception:
+            pass
+        try:
+            self.oa_model_combo.custom_deleted.connect(self._on_oa_custom_deleted)
+        except Exception:
+            pass
+        self._sync_openai_combo_items()
         oa_model_row.addWidget(self.oa_model_combo, 1)
+
+        self.oa_btn_fetch_models = StyledButton(tr("Получить"), compact=True)
+        self.oa_btn_fetch_models.setToolTip(tr("Автоматически запросить модели с текущего Base URL"))
+        self.oa_btn_fetch_models.setFixedHeight(36)
+        self.oa_btn_fetch_models.setFixedWidth(100)
+        self.oa_btn_fetch_models.set_hover_color(100, 150, 255)
+        self.oa_btn_fetch_models.clicked.connect(self._oa_fetch_models)
+        oa_model_row.addWidget(self.oa_btn_fetch_models)
+
+        self.oa_btn_clear_models = StyledButton(tr("Очистить"), compact=True)
+        self.oa_btn_clear_models.setToolTip(tr("Очистить список моделей текущего провайдера — модели можно получить заново кнопкой «Получить»"))
+        self.oa_btn_clear_models.setFixedHeight(36)
+        self.oa_btn_clear_models.setFixedWidth(100)
+        self.oa_btn_clear_models.set_hover_color(210, 90, 90)
+        self.oa_btn_clear_models.clicked.connect(self._oa_clear_models)
+        oa_model_row.addWidget(self.oa_btn_clear_models)
 
         saved_oa_effort = self.settings.get("openai_effort", "low")
         if saved_oa_effort not in OPENAI_EFFORT_LEVELS:
@@ -39891,6 +40143,77 @@ class ClaudeManager(QMainWindow):
         self._sync_openai_combo_items()
         self.log(tr("Список моделей очищен ({}) — получите модели заново").format(len(customs)), "info")
 
+    def _oa_fetch_models(self, silent=False):
+        """Автоматически получает список доступных моделей с активного Base URL (OpenAI / Codex)."""
+        base_url = (self.settings.get("openai_base_url") or "").strip()
+        sync_openai_api_key(self.settings)
+        api_key = (self.settings.get("openai_api_key") or "").strip()
+        if not base_url:
+            if not silent:
+                self.log(tr("Укажите Base URL и добавьте активный API ключ в окне «Управление»"), "warning")
+            return
+
+        if hasattr(self, "oa_btn_fetch_models"):
+            self.oa_btn_fetch_models.setText(tr("Загрузка..."))
+            self.oa_btn_fetch_models.setEnabled(False)
+
+        fetcher = _AnthropicModelsFetcher(base_url, api_key, self)
+
+        def _on_models_fetched(ok, models, info):
+            if hasattr(self, "oa_btn_fetch_models"):
+                self.oa_btn_fetch_models.setText(tr("Получить"))
+                self.oa_btn_fetch_models.setEnabled(True)
+
+            if ok and models:
+                url = _scope_url(self.settings, "oa")
+                by = self.settings.get("openai_custom_models_by_url")
+                if not isinstance(by, dict):
+                    by = {}
+                customs = list(by.get(url) or [])
+                for m in models:
+                    if m not in customs:
+                        customs.append(m)
+                by[url] = customs
+                self.settings["openai_custom_models_by_url"] = by
+
+                cur_m = self.settings.get("openai_model", "")
+                if not cur_m or cur_m in ("gpt-5.6-sol", "") or (cur_m not in OPENAI_MODEL_ORDER and cur_m not in customs):
+                    if models:
+                        self.settings["openai_model"] = models[0]
+                save_settings(self.settings)
+                self._sync_openai_combo_items()
+                if hasattr(self, "_write_codex_config") and self.settings.get("openai_api_key"):
+                    try:
+                        self._write_codex_config()
+                    except Exception:
+                        pass
+                sample = ", ".join(models[:5]) + ("..." if len(models) > 5 else "")
+                self.log(tr("Успешно получено {} моделей с {}: {}").format(len(models), base_url, sample), "success")
+            else:
+                if not silent:
+                    self.log(tr("Ошибка получения моделей с {}: {}").format(base_url, info), "error")
+
+        fetcher.models_fetched.connect(_on_models_fetched)
+        self._oa_fetcher = fetcher
+        fetcher.start()
+
+    def _oa_clear_models(self):
+        """Очищает список моделей активного провайдера (Base URL) вкладки OpenAI,
+        чтобы получить их заново кнопкой «Получить»."""
+        url = _scope_url(self.settings, "oa")
+        by = self.settings.get("openai_custom_models_by_url")
+        if not isinstance(by, dict):
+            by = {}
+        customs = list(by.get(url) or [])
+        if not customs:
+            self.log(tr("Список моделей текущего провайдера уже пуст"), "info")
+            return
+        by[url] = []
+        self.settings["openai_custom_models_by_url"] = by
+        save_settings(self.settings)
+        self._sync_openai_combo_items()
+        self.log(tr("Список моделей очищен ({}) — получите модели заново").format(len(customs)), "info")
+
     def _ensure_claude_custom_api_key_approved(self, api_key):
         """Добавляет API-ключ в approved-список ~/.claude.json, чтобы Claude Code
         не прерывал запуск интерактивным вопросом о подтверждении кастомного ключа."""
@@ -40011,6 +40334,12 @@ class ClaudeManager(QMainWindow):
                 self.oa_btn_manage_urls.setText(tr("Управление"))
             if hasattr(self, "oa_btn_manage_keys"):
                 self.oa_btn_manage_keys.setText(tr("Управление"))
+            if hasattr(self, "oa_btn_fetch_models"):
+                self.oa_btn_fetch_models.setText(tr("Получить"))
+                self.oa_btn_fetch_models.setToolTip(tr("Автоматически запросить модели с текущего Base URL"))
+            if hasattr(self, "oa_btn_clear_models"):
+                self.oa_btn_clear_models.setText(tr("Очистить"))
+                self.oa_btn_clear_models.setToolTip(tr("Очистить список моделей текущего провайдера — модели можно получить заново кнопкой «Получить»"))
             if hasattr(self, "oa_key_input"):
                 self.oa_key_input.setPlaceholderText(tr("Ключи не добавлены — откройте «Управление»"))
             if hasattr(self, "oa_model_combo"):
@@ -40219,10 +40548,23 @@ class ClaudeManager(QMainWindow):
         self.oa_model_combo.blockSignals(True)
         self.oa_model_combo.clear()
         self.oa_model_combo.addItems(items)
+        if hasattr(self, "_oa_model_colors"):
+            gray = QColor(145, 145, 150)
+            for m in customs:
+                self._oa_model_colors[m] = gray
+            for i in range(self.oa_model_combo.count()):
+                txt = self.oa_model_combo.itemText(i)
+                if txt in self._oa_model_colors:
+                    self.oa_model_combo.setItemData(i, self._oa_model_colors[txt], Qt.ForegroundRole)
         if cur in items:
             self.oa_model_combo.setCurrentText(cur)
         elif items:
             self.oa_model_combo.setCurrentText(items[0])
+            self.settings["openai_model"] = items[0]
+        sel_text = self.oa_model_combo.currentText()
+        if hasattr(self, "_oa_model_colors") and sel_text in self._oa_model_colors:
+            self.oa_model_combo.setTextColor(self._oa_model_colors[sel_text])
+            self.oa_model_combo.setAccentColor(self._oa_model_colors[sel_text])
         self.oa_model_combo.blockSignals(False)
 
     def _sync_custom_combo_items(self):
@@ -40308,6 +40650,44 @@ class ClaudeManager(QMainWindow):
         except Exception:
             pass
         self._sync_custom_combo_items()
+        try:
+            self.log(f"{tr('Модель удалена')}: {model_id}", "info")
+        except Exception:
+            pass
+
+    def _on_oa_custom_added(self, model_id):
+        """Своя модель добавлена из OpenAIModelDialog — сохраняем и дотягиваем комбо."""
+        try:
+            url = _scope_url(self.settings, "oa")
+            by = self.settings.get("openai_custom_models_by_url")
+            if not isinstance(by, dict):
+                by = {}
+            customs = list(by.get(url) or [])
+            if model_id and model_id not in customs:
+                customs.append(model_id)
+                by[url] = customs
+                self.settings["openai_custom_models_by_url"] = by
+                save_settings(self.settings)
+        except Exception:
+            pass
+        self._sync_openai_combo_items()
+
+    def _on_oa_custom_deleted(self, model_id):
+        """Своя модель удалена из OpenAIModelDialog — сохраняем и дотягиваем комбо."""
+        try:
+            url = _scope_url(self.settings, "oa")
+            by = self.settings.get("openai_custom_models_by_url")
+            if not isinstance(by, dict):
+                by = {}
+            customs = list(by.get(url) or [])
+            if model_id in customs:
+                customs.remove(model_id)
+                by[url] = customs
+                self.settings["openai_custom_models_by_url"] = by
+                save_settings(self.settings)
+        except Exception:
+            pass
+        self._sync_openai_combo_items()
         try:
             self.log(f"{tr('Модель удалена')}: {model_id}", "info")
         except Exception:
@@ -40664,6 +41044,8 @@ class ClaudeManager(QMainWindow):
             self._refresh_active_key_display()
             self._sync_openai_combo_items()
             self._refresh_freemodel_brand_visibility()
+            if new_current and "freemodel.dev" not in new_current.lower():
+                self._oa_fetch_models(silent=True)
         except Exception as e:
             print(f"[_persist_oa_url_state] Не удалось сохранить: {e}")
 

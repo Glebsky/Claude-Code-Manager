@@ -1,3 +1,29 @@
+# 🚀 Claude Code Manager v1.1
+
+A feature release introducing **OpenAI & Codex Model Auto-Discovery**, custom model management in the OpenAI tab, per-provider key and model isolation by Base URL, provider filter chips, and security enhancements.
+
+---
+
+## 🌟 What's New in v1.1
+
+### 🤖 OpenAI & Codex Model Auto-Discovery (`/v1/models`)
+- Added **"Fetch" («Получить»)** and **"Clear" («Очистить»)** buttons to the OpenAI (Codex) tab, mirroring the Anthropic experience.
+- Automatically connects to your OpenAI Base URL (`/v1/models`, `/models`) using your active API key and parses available models.
+- Silent auto-discovery: switching to a custom Base URL automatically queries available models in the background.
+
+### 🎨 Custom Models & Enhanced Model Dialog for OpenAI
+- **"Custom Models" («Свои модели»)** strip with a `+` button in `OpenAIModelDialog` for fast model switching and configuration.
+- Dimming of built-in models slider when a custom model is selected, with seamless re-focusing when clicking standard models.
+- Dedicated `CustomModelsWindow` support for OpenAI (`scope="oa"`) with tailored placeholder (`gpt-4o`) and clean interface.
+- Gray accent highlighting for custom models in dropdowns and full synchronization with Codex CLI configs.
+
+### 🔒 Per-Provider Key & Model Isolation
+- API keys and discovered models are strictly isolated per Base URL provider, preventing accidental credential or model leaks across different endpoints.
+- Quick provider filter chips for multi-provider setups.
+- Secure key generation using cryptographic secrets.
+
+---
+
 # 🚀 Claude Code Manager v1.0
 
 A major release introducing the **Multi-Model Role Engine**, dynamic in-session `/model` switching for Claude Code CLI, one-click automated model discovery from custom Base URLs, ambient particle background animation, and unified multi-agent synchronization.
